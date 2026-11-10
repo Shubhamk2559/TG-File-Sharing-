@@ -52,7 +52,7 @@ DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))            # videos per u
 QUOTA_SAVE_EVERY = int(os.environ.get("QUOTA_SAVE_EVERY", "600"))  # seconds between KV saves of the counters
 AD_ZONE = os.environ.get("AD_ZONE", "").strip()                    # Monetag zone id
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")          # public https URL of this bot's web server
-AD_MIN_WATCH = int(os.environ.get("AD_MIN_WATCH", "5"))            # min seconds between ad start and finish
+AD_MIN_WATCH = int(os.environ.get("AD_MIN_WATCH", "3"))            # min seconds between ad start and finish
 AD_TOKEN_TTL = 600                                                 # seconds a "Watch ad" button stays valid
 ADMINS_SKIP_ADS = os.environ.get("ADMINS_SKIP_ADS", "0") == "1"
 AD_READY = bool(re.sub(r"\D", "", AD_ZONE) and WEBAPP_URL.startswith("https://"))
@@ -556,6 +556,7 @@ async def deliver(c, uid, code, items=None):
 AD_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Unlock files</title>
+<link rel="preconnect" href="https://libtl.com"><link rel="dns-prefetch" href="https://libtl.com">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://libtl.com/sdk.js" data-zone="__ZONE__" data-sdk="show___ZONE__"></script>
 <style>
@@ -587,23 +588,59 @@ let running=false;
 async function run(){
  if(running)return;running=true;$("btn").disabled=true;
  try{
-  const s=await post("/api/ad/start");
-  if(!s.ok){say("⚠️","Cannot start",s.error||"Please open the file link in the bot again.",!!s.retry);return;}
-  const show=window["show_"+ZONE];
+  const sp=post("/api/ad/start");   /* runs in parallel: the ad opens immediately */
+  let show=window["show_"+ZONE];
+  for(let i=0;typeof show!=="function"&&i<40;i++){await new Promise(r=>setTimeout(r,50));show=window["show_"+ZONE];}
   if(typeof show!=="function")throw new Error("sdk");
-  await show({ymid:String(s.ymid||"")});
+  const nonce=T.split(".").slice(-2)[0]||"";
+  await show({ymid:nonce});
+  const s=await sp;
+  if(!s.ok){say("⚠️","Cannot start",s.error||"Please open the file link in the bot again.",!!s.retry);return;}
   const d=await post("/api/ad/done");
-  if(d.ok){say("✅","Unlocked!","Your files are being sent to the chat.",false);setTimeout(()=>tg.close(),1500);}
+  if(d.ok){say("✅","Unlocked!","Your files are being sent to the chat.",false);setTimeout(()=>tg.close(),500);}
   else{say("⚠️","Could not unlock",d.error||"Please try again.",!!d.retry);}
  }catch(e){
   say("⚠️","Ad not completed","Watch the full ad. If it does not load, turn off your ad blocker or private DNS, then tap Try again.",true);
  }finally{running=false;$("btn").disabled=false;}
 }
-$("btn").onclick=run;window.addEventListener("load",()=>setTimeout(run,300));
+$("btn").onclick=run;run();
 </script></body></html>"""
 
 
+ERR_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;display:flex;align-items:center;justify-content:center;
+height:100vh;margin:0;padding:24px;box-sizing:border-box;text-align:center;background:#17212b;color:#f5f5f5}
+p{color:#9aa5b1;line-height:1.45}</style></head><body><div><div style="font-size:52px">⚠️</div><h2>Cannot unlock</h2>
+<p>__MSG__</p></div><script>try{Telegram.WebApp.ready();Telegram.WebApp.expand();}catch(e){}</script></body></html>"""
+
+AD_PB_SECRET = os.environ.get("AD_POSTBACK_SECRET", "").strip()   # optional strict mode (Monetag postback)
+ad_rewarded = TTLCache(50000)                                      # nonce -> True (Monetag confirmed the ad)
+
+
+async def ad_postback(request):
+    """Monetag server-to-server postback: .../api/ad/pb?ymid={ymid}&reward_event_type={reward_event_type}&s=SECRET"""
+    q = request.query
+    if not AD_PB_SECRET or not hmac.compare_digest(q.get("s", "").encode(), AD_PB_SECRET.encode()):
+        return web.Response(status=403, text="forbidden")
+    ymid = q.get("ymid", "")
+    if ymid and q.get("reward_event_type", "valued") != "not_valued":
+        ad_rewarded.set(ymid, True, AD_TOKEN_TTL + 120)
+    return web.Response(text="ok")
+
+
 async def ad_page(request):
+    tok = read_token(request.query.get("t", ""))
+    err = None
+    if not tok:
+        err = "This link has expired. Please open the file link in the bot again."
+    elif ad_used.get(tok[2]):
+        err = "This unlock was already used. Open the file link again."
+    elif quota_left(tok[0]) <= 0:
+        err = f"Daily limit reached ({limit_for(tok[0])} videos). " + reset_text()
+    if err:   # no ad is shown for a request that can never unlock anything
+        return web.Response(text=ERR_HTML.replace("__MSG__", html.escape(err)), content_type="text/html",
+                            headers={"Cache-Control": "no-store"})
     html_text = AD_HTML.replace("__ZONE__", re.sub(r"\D", "", AD_ZONE))
     return web.Response(text=html_text, content_type="text/html", headers={"Cache-Control": "no-store"})
 
@@ -642,6 +679,13 @@ async def ad_done(request):
         return web.json_response({"ok": False, "error": "Session expired. Please try again.", "retry": True})
     if time.monotonic() - t0 < AD_MIN_WATCH:
         return web.json_response({"ok": False, "error": "Please watch the full ad.", "retry": True})
+    if AD_PB_SECRET:   # strict mode: wait (max 8s) until Monetag itself confirmed this ad
+        for _ in range(16):
+            if ad_rewarded.get(nonce):
+                break
+            await asyncio.sleep(0.5)
+        else:
+            return web.json_response({"ok": False, "error": "Ad not confirmed yet. Please try again.", "retry": True})
     ad_sessions.pop(nonce)
     ad_used.set(nonce, True, AD_TOKEN_TTL + 120)
     bump("ads")
@@ -720,6 +764,30 @@ async def load_premium():
             premium["done"] = [str(x) for x in d.get("done", [])][-500:]
     except Exception as e:
         logging.error("could not load premium data: %s", e)
+
+
+ORDERS_KEY = "__orders"
+
+
+async def save_orders():
+    now = time.time()
+    doc = {k: v for k, v in orders.items() if now - v["ts"] < 900 and k not in premium["done"]}
+    try:
+        await kv_put(ORDERS_KEY, doc)
+    except Exception as e:
+        logging.error("saving pending orders failed: %s", e)
+
+
+async def load_orders(c):
+    """After a restart: pick up payments that were still open and keep verifying them."""
+    try:
+        d = await kv_get(ORDERS_KEY)
+    except Exception as e:
+        return logging.error("could not load pending orders: %s", e)
+    for oid, o in (d or {}).items():
+        if time.time() - o.get("ts", 0) < 900 and oid not in premium["done"] and 0 <= o.get("idx", -1) < len(PLANS):
+            orders[oid] = o
+            spawn(watch_order(c, oid, o["ts"] + 330))
 
 
 async def save_premium():
@@ -846,6 +914,9 @@ async def watch_order(c, order_id, deadline):
                 return
         elif st == "expired":
             break
+    if order_id in orders and order_id not in premium["done"]:   # last chance: paid right at the end?
+        if await fam_status(order_id) == "success" and await fulfill(c, order_id):
+            return
     o = orders.pop(order_id, None) if order_id not in premium["done"] else None
     if o:
         try:
@@ -904,6 +975,8 @@ async def pay_cb(c, q):
         if order_cooldown.get(uid):
             return await say("⏳ Please wait a few seconds.")
         order_cooldown.set(uid, True, 8)
+        if any(o["uid"] == uid and time.time() - o["ts"] < 300 for o in orders.values()):
+            return await say("⏳ You already have a pending payment. Pay it, or wait 5 minutes for it to expire.", True)
         price, lim, days = PLANS[idx]
         await say("Creating payment…")
         try:
@@ -935,6 +1008,7 @@ async def pay_cb(c, q):
         if sent is None:
             sent = await retry(q.message.reply, caption, parse_mode=ParseMode.HTML, reply_markup=mk)
         orders[oid]["mid"] = sent.id
+        await save_orders()
         spawn(watch_order(c, oid, time.time() + 330))
         return
 
@@ -1828,7 +1902,8 @@ async def main():
                         web.get("/ad", ad_page),
                         web.post("/api/ad/start", ad_start),
                         web.post("/api/ad/done", ad_done),
-                        web.post("/api/fam/webhook", fam_webhook)])
+                        web.post("/api/fam/webhook", fam_webhook),
+                        web.get("/api/ad/pb", ad_postback)])
     runner = web.AppRunner(web_app, access_log=None)  # no per-request log spam from health checks
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
@@ -1847,6 +1922,7 @@ async def main():
         logging.warning("Ads are OFF: set both AD_ZONE and an https WEBAPP_URL")
     if PAY_READY:
         await load_premium()
+        await load_orders(app)
         logging.info("UPI payments ON (FamGateway): %d plans, webhook %s", len(PLANS),
                      f"{WEBAPP_URL}/api/fam/webhook" if WEBAPP_URL.startswith("https://") else "off (polling only)")
     elif FAM_API_KEY:
