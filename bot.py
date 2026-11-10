@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -9,6 +9,8 @@ try:  # faster event loop (optional) - must be installed BEFORE pyrogram is impo
     uvloop.install()
 except Exception:
     pass
+
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiohttp import web
@@ -551,6 +553,389 @@ async def stats_cmd(c, m):
     await m.reply(text)
 
 
+# ======================================================================
+#  SCHEDULED POSTS:  SOURCE_CHANNEL (private, many videos) -> TARGET_CHANNEL
+#  captioned video + caption-less videos right below it = ONE post (one link)
+# ======================================================================
+SOURCE_CHANNEL = int(os.environ.get("SOURCE_CHANNEL", "0"))
+TARGET_CHANNEL = int(os.environ.get("TARGET_CHANNEL", "0"))
+BUTTON_TEXT = os.environ.get("BUTTON_TEXT", "▶️ Watch Now")
+POST_LINK_BOT = os.environ.get("POST_LINK_BOT", "0") == "1"   # 1 = t.me/bot?start=code, 0 = WORKER_URL/code
+try:
+    TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Kolkata"))
+except Exception:
+    logging.warning("bad TIMEZONE, using UTC")
+    TZ = timezone.utc
+
+
+def _nl(text):
+    """'\\n' (and '/n' not followed by a letter) in the env value -> real new line."""
+    return re.sub(r"\\n|/n(?![A-Za-z])", "\n", text)
+
+
+POST_CAPTION = _nl(os.environ.get("POST_CAPTION", "🔥 New Video Uploaded!\\n\\nWatch now 👇"))
+
+SCHED_KEY, LIB_KEY = "__sched", "__lib"   # "__" keys are hidden from /export & /restore
+sched = None        # {"last": int, "posted": [first_msg_ids], "queue": [[epoch, tries], ...]}
+lib = None          # [{"i": first_id, "c": caption_html, "v": [[msg_id, file_id, unique_id], ...]}]
+dirty = set()       # which docs still need saving to the worker
+sched_lock = asyncio.Lock()
+scan_lock = asyncio.Lock()
+made_codes = {}     # group id -> code already written (a retry doesn't write again)
+
+SCHEDULE_HELP = (
+    "📅 /schedule examples:\n"
+    "• /schedule 10:00 14:00 18:30  → har time pe 1 post\n"
+    "• /schedule 6 10:00 2h  → 10:00 se shuru, har 2 ghante me, total 6 posts\n"
+    "• /schedule 2026-11-12 10:00 14:00  → us date ke liye\n"
+    f"Timezone: {TZ}")
+
+
+def feature_on():
+    return bool(SOURCE_CHANNEL and TARGET_CHANNEL)
+
+
+def fmt_ts(ts):
+    return datetime.fromtimestamp(ts, TZ).strftime("%d %b %H:%M")
+
+
+async def kv_get(key):
+    try:
+        text = await api("GET", "get", params={"code": key})
+    except RuntimeError as e:
+        if str(e).startswith("worker 404"):
+            return None
+        raise
+    return json.loads(text) if text.strip() else None
+
+
+async def kv_put(key, obj):
+    await api("POST", "put", params={"code": key}, data=json.dumps(obj))
+
+
+async def load_sched():
+    """Load queue + library from the worker once. Never starts from 'empty' if the load failed."""
+    global sched, lib
+    if sched is not None and lib is not None:
+        return True
+    try:
+        s, l = await kv_get(SCHED_KEY), await kv_get(LIB_KEY)
+    except Exception as e:
+        logging.error("could not load schedule data: %s", e)
+        return False
+    if sched is None:
+        sched = s if isinstance(s, dict) else {}
+        sched.setdefault("last", 0)
+        sched.setdefault("posted", [])
+        sched.setdefault("queue", [])
+    if lib is None:
+        lib = l if isinstance(l, list) else []
+    return True
+
+
+async def persist(*names):
+    """Save docs to the worker; on failure they stay 'dirty' and the scheduler retries."""
+    dirty.update(names)
+    try:
+        for name, key, obj in (("lib", LIB_KEY, lib), ("sched", SCHED_KEY, sched)):
+            if name in dirty:
+                await kv_put(key, obj)
+                dirty.discard(name)
+        return True
+    except Exception as e:
+        logging.error("saving schedule data failed (will retry): %s", e)
+        return False
+
+
+def video_of(m):
+    v = getattr(m, "video", None)
+    if v:
+        return v
+    d = getattr(m, "document", None)
+    if d and (getattr(d, "mime_type", None) or "").startswith("video/"):
+        return d
+
+
+def group_messages(msgs, cur=None, known=frozenset()):
+    """msgs in id order. Captioned video starts a post; caption-less videos below it join it."""
+    groups, orphans = [], 0
+    for m in msgs:
+        if getattr(m, "empty", False) or m.id in known:
+            continue
+        v = video_of(m)
+        if not v:
+            continue
+        entry = [m.id, v.file_id, v.file_unique_id]
+        if (m.caption or "").strip():
+            cur = {"i": m.id, "c": m.caption.html, "v": [entry]}
+            groups.append(cur)
+        elif cur is not None:
+            cur["v"].append(entry)
+        else:
+            orphans += 1   # caption-less video with no captioned video above it
+    return groups, orphans, cur
+
+
+async def last_msg_id(c):
+    """Newest message id of the source channel: post a dot and delete it right away."""
+    t = await retry(c.send_message, SOURCE_CHANNEL, ".", disable_notification=True)
+    try:
+        await retry(t.delete)
+    except Exception:
+        pass
+    return t.id - 1
+
+
+def parse_schedule(args):
+    """-> list of epoch seconds. Raises ValueError with a readable message."""
+    now = datetime.now(TZ)
+    times, day, count, interval = [], None, None, None
+    for a in args:
+        a = a.lower()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", a):
+            try:
+                day = datetime.strptime(a, "%Y-%m-%d")
+            except ValueError:
+                raise ValueError(f"galat date: {a}")
+        elif re.fullmatch(r"\d{1,2}:\d{2}", a):
+            h, mi = map(int, a.split(":"))
+            if h > 23 or mi > 59:
+                raise ValueError(f"galat time: {a}")
+            times.append((h, mi))
+        elif re.fullmatch(r"\d+[mh]", a):
+            interval = int(a[:-1]) * (60 if a[-1] == "m" else 3600)
+        elif a.isdigit():
+            count = int(a)
+        else:
+            raise ValueError(f"samajh nahi aaya: {a}")
+    if not times:
+        raise ValueError("Time do, jaise 18:30")
+
+    def at(h, mi):
+        if day:
+            dt = day.replace(hour=h, minute=mi, tzinfo=TZ)
+            if dt <= now:
+                raise ValueError(f"{dt:%d %b %H:%M} ka time nikal chuka hai")
+            return dt
+        dt = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+        return dt if dt > now else dt + timedelta(days=1)
+
+    if count is not None or interval is not None:
+        if len(times) != 1 or not count or not interval:
+            raise ValueError("Format: /schedule 6 10:00 2h  (count, start time, gap)")
+        if interval < 60 or count > 500:
+            raise ValueError("Gap kam se kam 1m aur count max 500")
+        start = at(*times[0])
+        stamps = [start + timedelta(seconds=interval * i) for i in range(count)]
+    else:
+        stamps = sorted({at(h, mi) for h, mi in times})
+    return [int(x.timestamp()) for x in stamps]
+
+
+def new_code():
+    return "".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(8))
+
+
+async def publish_next(c):
+    """Next unposted post -> share link (KV write) -> post in TARGET_CHANNEL. None if nothing left."""
+    posted = set(sched["posted"])
+    grp = next((g for g in lib if g["i"] not in posted), None)
+    if not grp:
+        return None
+    code = made_codes.get(grp["i"])
+    if not code:
+        code, seen, items = new_code(), set(), []
+        for n, (mid, fid, uid) in enumerate(grp["v"]):
+            if uid in seen:
+                continue
+            seen.add(uid)
+            items.append({"u": uid, "f": fid, "cap": grp["c"] if n == 0 else "",
+                          "l": [[SOURCE_CHANNEL, mid]]})
+        await put_items(code, items)
+        made_codes[grp["i"]] = code
+    link = (f"https://t.me/{c.me.username}?start={code}" if POST_LINK_BOT
+            else f"{WORKER_URL}/{code}")
+    # link lives ONLY inside the button (never in the caption text)
+    await retry(c.copy_message, TARGET_CHANNEL, SOURCE_CHANNEL, grp["i"], caption=POST_CAPTION,
+                parse_mode=ParseMode.HTML, reply_markup=Markup([[Btn(BUTTON_TEXT, url=link)]]))
+    sched["posted"].append(grp["i"])
+    made_codes.pop(grp["i"], None)
+    return code, len(grp["v"]), link
+
+
+async def notify_admins(c, text):
+    for a in ADMINS:
+        try:
+            await retry(c.send_message, a, text)
+        except Exception:
+            pass
+
+
+async def run_due(c):
+    while True:
+        note = None
+        async with sched_lock:
+            q = sched["queue"]
+            if not q or q[0][0] > time.time():
+                return
+            ent = q[0]
+            try:
+                res = await publish_next(c)
+            except Exception as e:
+                ent[1] += 1
+                logging.error("scheduled post failed: %s", e)
+                if ent[1] >= 3:
+                    q.pop(0)
+                    note = f"❌ {fmt_ts(ent[0])} wala post 3 baar fail hua, hata diya.\n{e}\n(Bot TARGET channel me admin hai?)"
+                else:
+                    ent[0] = int(time.time()) + 300
+                    q.sort()
+                    note = f"⚠️ Scheduled post fail hua: {e}\n5 min baad dobara try karunga."
+            else:
+                q.pop(0)
+                if res is None:
+                    note = "📭 Scheduled time aaya par koi unposted post nahi bacha. /scan se naye posts lao."
+            await persist("sched")
+        if note:
+            await notify_admins(c, note)
+        await asyncio.sleep(2)  # gap between catch-up posts
+
+
+async def scheduler(c):
+    while True:
+        try:
+            if await load_sched():
+                if dirty:
+                    await persist()
+                await run_due(c)
+        except Exception as e:
+            logging.error("scheduler error: %s", e)
+        await asyncio.sleep(5)
+
+
+async def feature_ready(m):
+    if not feature_on():
+        await m.reply("⚠️ SOURCE_CHANNEL aur TARGET_CHANNEL env set karo.")
+        return False
+    if not await load_sched():
+        await m.reply("⚠️ Worker se data load nahi hua, thodi der baad try karo.")
+        return False
+    return True
+
+
+@app.on_message(filters.command("scan") & filters.private & is_admin)
+async def scan_cmd(c, m):
+    """Read SOURCE_CHANNEL history by message id and build posts. /scan  |  /scan from  |  /scan from to"""
+    if not await feature_ready(m):
+        return
+    if scan_lock.locked():
+        return await m.reply("🔍 Scan already chal raha hai.")
+    async with scan_lock:
+        try:
+            args = [int(x) for x in m.command[1:3]]
+        except ValueError:
+            return await m.reply("Usage: /scan   ya   /scan from_id   ya   /scan from_id to_id")
+        status = await m.reply("🔍 Scanning…")
+        try:
+            hi = args[1] if len(args) > 1 else await last_msg_id(c)
+            lo = max(args[0] if args else sched["last"] + 1, 1)
+            if hi < lo:
+                return await status.edit("✅ Naya kuch nahi hai (pehle se scanned).")
+            if hi - lo > 200000:
+                return await status.edit("❌ Range bahut badi hai (max 200000 ids).")
+            known = {x[0] for g in lib for x in g["v"]}
+            posted = set(sched["posted"])
+            before = sum(len(g["v"]) for g in lib)
+            # a post cut in half by the previous scan keeps growing (unless already posted)
+            cur = lib[-1] if lib and lib[-1]["i"] not in posted and lo > lib[-1]["v"][-1][0] else None
+            new, orphans = [], 0
+            for s in range(lo, hi + 1, 200):
+                msgs = await retry(c.get_messages, SOURCE_CHANNEL, list(range(s, min(s + 200, hi + 1))))
+                g, o, cur = group_messages(msgs, cur, known)
+                new += g
+                orphans += o
+        except Exception as e:
+            logging.error("scan failed: %s", e)
+            return await status.edit(f"❌ Scan fail: {e}\nBot SOURCE channel me admin hai? Manual: /scan 1 5000")
+        async with sched_lock:
+            lib.extend(new)
+            lib.sort(key=lambda g: g["i"])
+            sched["last"] = max(sched["last"], hi)
+            ok = await persist("lib", "sched")
+            vids = sum(len(g["v"]) for g in lib) - before
+            posted = set(sched["posted"])
+            left = sum(1 for g in lib if g["i"] not in posted)
+        await status.edit(f"✅ Scan complete (id {lo}–{hi})\n🆕 Naye posts: {len(new)}\n🎬 Naye videos: {vids}\n"
+                          f"⏭ Bina caption ke orphan videos (skip): {orphans}\n"
+                          f"📦 Total posts: {len(lib)} | Unposted: {left}"
+                          + ("" if ok else "\n⚠️ Worker save fail, auto-retry chalega."))
+
+
+@app.on_message(filters.command("schedule") & filters.private & is_admin)
+async def schedule_cmd(c, m):
+    if not await feature_ready(m):
+        return
+    try:
+        stamps = parse_schedule(m.command[1:])
+    except ValueError as e:
+        return await m.reply(f"❌ {e}\n\n{SCHEDULE_HELP}")
+    async with sched_lock:
+        sched["queue"] += [[t, 0] for t in stamps]
+        sched["queue"].sort()
+        ok = await persist("sched")
+        posted = set(sched["posted"])
+        left = sum(1 for g in lib if g["i"] not in posted)
+        total = len(sched["queue"])
+    lines = [f"✅ {len(stamps)} post schedule hue ({fmt_ts(stamps[0])} se {fmt_ts(stamps[-1])})"]
+    lines += [f"• {fmt_ts(t)}" for t in stamps[:15]] + (["…"] if len(stamps) > 15 else [])
+    if total > left:
+        lines.append(f"\n⚠️ Queue me {total} hain par unposted posts sirf {left}. /scan se aur lao.")
+    if not ok:
+        lines.append("⚠️ Worker save fail, auto-retry chalega.")
+    await m.reply("\n".join(lines))
+
+
+@app.on_message(filters.command("posts") & filters.private & is_admin)
+async def posts_cmd(c, m):
+    if not await feature_ready(m):
+        return
+    posted = set(sched["posted"])
+    done = sum(1 for g in lib if g["i"] in posted)
+    q = sched["queue"]
+    text = (f"📦 Library: {len(lib)} posts ({sum(len(g['v']) for g in lib)} videos)\n"
+            f"✅ Posted: {done}\n🕓 Unposted: {len(lib) - done}\n⏰ Scheduled: {len(q)}")
+    if q:
+        text += "\n\n" + "\n".join(f"• {fmt_ts(t)}" for t, _ in q[:15]) + ("\n…" if len(q) > 15 else "")
+    await m.reply(text)
+
+
+@app.on_message(filters.command("unschedule") & filters.private & is_admin)
+async def unschedule_cmd(c, m):
+    if not await feature_ready(m):
+        return
+    async with sched_lock:
+        n = len(sched["queue"])
+        sched["queue"] = []
+        await persist("sched")
+    await m.reply(f"🗑 {n} scheduled post cancel kar diye.")
+
+
+@app.on_message(filters.command("postnow") & filters.private & is_admin)
+async def postnow_cmd(c, m):
+    """Post the next unposted post right now (test)."""
+    if not await feature_ready(m):
+        return
+    async with sched_lock:
+        try:
+            res = await publish_next(c)
+        except Exception as e:
+            return await m.reply(f"❌ Post fail: {e}\n(Bot TARGET channel me admin hai?)")
+        if res is None:
+            return await m.reply("📭 Koi unposted post nahi bacha. /scan karo.")
+        await persist("sched")
+    await m.reply(f"✅ Posted: #{res[0]} ({res[1]} videos)\n🔗 {res[2]}", disable_web_page_preview=True)
+
+
 async def main():
     global http
     http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=100, ttl_dns_cache=300),
@@ -565,6 +950,11 @@ async def main():
         await api("POST", "put", params={"code": "__cfg_bot"}, data=app.me.username)
     except Exception as e:
         logging.error("could not save bot username to worker: %s", e)
+    if feature_on():
+        t = asyncio.create_task(scheduler(app))
+        bg_tasks.add(t)
+        t.add_done_callback(bg_tasks.discard)
+        logging.info("Post scheduler on: %s -> %s", SOURCE_CHANNEL, TARGET_CHANNEL)
     logging.info("Bot @%s running", app.me.username)
     await idle()
     await app.stop()
