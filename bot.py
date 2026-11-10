@@ -1,13 +1,25 @@
 from datetime import datetime, timezone
-import asyncio, html, io, json, logging, os, re, secrets, string
+from collections import OrderedDict
+from contextlib import asynccontextmanager
+from functools import lru_cache
+import asyncio, copy, html, io, json, logging, os, re, secrets, time
+
+try:  # faster event loop (optional) - must be installed BEFORE pyrogram is imported
+    import uvloop
+    uvloop.install()
+except Exception:
+    pass
+
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, idle
+from pyrogram import errors as tg_errors
 from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.errors import FloodWait, UserNotParticipant
 from pyrogram.types import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("pyrogram").setLevel(logging.WARNING)  # less log I/O under load
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -26,10 +38,15 @@ PORT = int(os.environ.get("PORT", "8000"))
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")   # optional: for exact Cloudflare numbers in /stats
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")     # optional: token with "Account Analytics: Read"
 
+# ---- performance knobs (all optional) ----
+WORKERS = int(os.environ.get("WORKERS", "100"))        # concurrent update handlers (cheap: coroutines)
+SEND_RATE = float(os.environ.get("SEND_RATE", "25"))   # max Telegram sends/sec (limit is ~30) -> no FloodWait storms
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))    # seconds a code stays cached (saves Cloudflare KV reads)
+CACHE_MAX = int(os.environ.get("CACHE_MAX", "5000"))   # max codes kept in RAM
+
 app = Client("filebot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
-             in_memory=True, workers=16)
+             in_memory=True, workers=WORKERS)
 http: aiohttp.ClientSession = None
-lock = asyncio.Lock()
 
 CODE_RE = re.compile(r"#([A-Za-z0-9_-]{1,60})")
 MEDIA_ATTRS = ("document", "video", "audio", "photo", "animation", "voice", "video_note")
@@ -37,27 +54,138 @@ is_admin = filters.create(lambda _, __, m: m.from_user and m.from_user.id in ADM
 media = (filters.document | filters.video | filters.audio | filters.photo
          | filters.animation | filters.voice | filters.video_note)
 
+# errors caused by the *user* (blocked bot, deleted account...) - no point trying other locations
+USER_ERRORS = tuple(getattr(tg_errors, n) for n in (
+    "UserIsBlocked", "InputUserDeactivated", "UserDeactivated", "UserDeactivatedBan",
+    "ChatWriteForbidden") if hasattr(tg_errors, n))
+
+
+# ---------- small building blocks ----------
+class TTLCache:
+    """Tiny LRU + TTL cache. get() returns None on miss."""
+
+    def __init__(self, maxsize):
+        self.d, self.max = OrderedDict(), maxsize
+
+    def get(self, key):
+        e = self.d.get(key)
+        if e is None:
+            return None
+        if e[0] < time.monotonic():
+            del self.d[key]
+            return None
+        self.d.move_to_end(key)
+        return e[1]
+
+    def set(self, key, val, ttl):
+        self.d[key] = (time.monotonic() + ttl, val)
+        self.d.move_to_end(key)
+        while len(self.d) > self.max:
+            self.d.popitem(last=False)
+
+    def pop(self, key):
+        self.d.pop(key, None)
+
+
+class Limiter:
+    """Spreads Telegram calls evenly (lock-free, single event loop). pause() = global FloodWait."""
+
+    def __init__(self, rate):
+        self.gap, self.next = 1.0 / max(rate, 1), 0.0
+
+    async def wait(self):
+        now = time.monotonic()
+        t = max(now, self.next)
+        self.next = t + self.gap
+        if t > now:
+            await asyncio.sleep(t - now)
+
+    def pause(self, sec):
+        self.next = max(self.next, time.monotonic() + sec)
+
+
+class KeyedLock:
+    """One lock per code (uploads to different codes don't block each other); cleans itself up."""
+
+    def __init__(self):
+        self.d = {}
+
+    @asynccontextmanager
+    async def __call__(self, key):
+        e = self.d.setdefault(key, [asyncio.Lock(), 0])
+        e[1] += 1
+        try:
+            async with e[0]:
+                yield
+        finally:
+            e[1] -= 1
+            if e[1] == 0:
+                self.d.pop(key, None)
+
+
+limiter = Limiter(SEND_RATE)
+code_lock = KeyedLock()
+items_cache = TTLCache(CACHE_MAX)      # code -> items (positive hits CACHE_TTL, "not found" 30s)
+member_cache = TTLCache(50000)         # uid -> True (joined FORCE_SUB), 2 min
+dead_locs = TTLCache(20000)            # (chat, msg_id) that failed to copy -> skipped for 5 min
+inflight = {}                          # code -> running fetch (many users, one KV read)
+busy = set()                           # users whose delivery is in progress
+bg_tasks = set()                       # keep references to background tasks
+restoring = False
+
 
 # ---------- Cloudflare Worker storage ----------
 async def api(method, path, **kw):
-    async with http.request(method, f"{WORKER_URL}/api/{path}",
-                            headers={"x-secret": API_SECRET}, **kw) as r:
-        text = await r.text()
-        if r.status != 200:
-            raise RuntimeError(f"worker {r.status}: {text[:100]}")
-        return text
+    err = None
+    for attempt in (0, 1):  # one quick retry on network error / 5xx (all calls are idempotent)
+        try:
+            async with http.request(method, f"{WORKER_URL}/api/{path}",
+                                    headers={"x-secret": API_SECRET}, **kw) as r:
+                text = await r.text()
+                if r.status == 200:
+                    return text
+                err = RuntimeError(f"worker {r.status}: {text[:100]}")
+                if r.status < 500:
+                    raise err
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            err = e
+        if attempt == 0:
+            await asyncio.sleep(0.3)
+    raise err
 
 
-async def get_items(code):
-    return json.loads(await api("GET", "get", params={"code": code}))
+async def _load(code):
+    items = json.loads(await api("GET", "get", params={"code": code}))
+    items_cache.set(code, items, CACHE_TTL if items else 30)
+    return items
+
+
+async def get_items(code, fresh=False):
+    """Cached read. fresh=True bypasses cache (used before writing; callers must deepcopy)."""
+    if fresh:
+        return await _load(code)
+    hit = items_cache.get(code)
+    if hit is not None:
+        return hit
+    task = inflight.get(code)
+    if task is None:
+        task = inflight[code] = asyncio.ensure_future(_load(code))
+        task.add_done_callback(lambda _, c=code: inflight.pop(c, None))
+    return await asyncio.shield(task)
 
 
 async def put_items(code, items):
-    await api("POST", "put", params={"code": code}, data=json.dumps(items))
+    try:
+        await api("POST", "put", params={"code": code}, data=json.dumps(items))
+    except Exception:
+        items_cache.pop(code)
+        raise
+    items_cache.set(code, items, CACHE_TTL)
 
 
 async def del_code(code):
     await api("POST", "delete", params={"code": code})
+    items_cache.pop(code)
 
 
 async def list_codes():
@@ -76,11 +204,15 @@ def bump(key, n=1):
 
 
 async def retry(fn, *a, **k):
-    while True:
+    """Rate-limited Telegram call; on FloodWait everybody pauses together, then retries."""
+    for i in range(5):
+        await limiter.wait()
         try:
             return await fn(*a, **k)
         except FloodWait as e:
-            await asyncio.sleep(e.value + 1)
+            if i == 4:
+                raise
+            limiter.pause(e.value + 1)
 
 
 def media_of(m):
@@ -90,30 +222,42 @@ def media_of(m):
             return o.file_id, o.file_unique_id
 
 
-async def index_message(m):
-    """Save message under its #code. Same file (unique id) -> one item with many locations."""
-    cap = m.caption.html if m.caption else ""
-    cm, mi = CODE_RE.search(m.caption or ""), media_of(m)
-    if not cm or not mi:
-        return None
-    code = cm.group(1).lower()
-    if code.startswith("__"):
-        return None
-    fid, uid = mi
-    loc = [m.chat.id, m.id]
-    async with lock:
-        items = await get_items(code)
-        for it in items:
-            if it["u"] == uid:
-                it["f"], it["cap"] = fid, cap
-                it["l"] = [x for x in it["l"] if x[0] != loc[0]] + [loc]
-                break
-        else:
-            items.append({"u": uid, "f": fid, "cap": cap, "l": [loc]})
-        await put_items(code, items)
-    return code, len(items)
+async def index_messages(msgs):
+    """Save messages under their #code (one KV write per code, none if nothing changed).
+    Same file (unique id) -> one item with many locations."""
+    groups = {}
+    for m in msgs:
+        cm, mi = CODE_RE.search(m.caption or ""), media_of(m)
+        if not cm or not mi:
+            continue
+        code = cm.group(1).lower()
+        if code.startswith("__"):
+            continue
+        groups.setdefault(code, []).append((mi, m.caption.html, [m.chat.id, m.id]))
+    result = None
+    for code, entries in groups.items():
+        async with code_lock(code):
+            items = copy.deepcopy(await get_items(code, fresh=True))
+            changed = False
+            for (fid, uid), cap, loc in entries:
+                for it in items:
+                    if it["u"] == uid:
+                        if it["f"] == fid and it["cap"] == cap and loc in it["l"]:
+                            break  # already indexed exactly like this
+                        it["f"], it["cap"] = fid, cap
+                        it["l"] = [x for x in it["l"] if x[0] != loc[0]] + [loc]
+                        changed = True
+                        break
+                else:
+                    items.append({"u": uid, "f": fid, "cap": cap, "l": [loc]})
+                    changed = True
+            if changed:
+                await put_items(code, items)
+        result = result or (code, len(items))
+    return result
 
 
+@lru_cache(maxsize=4096)
 def public_caption(cap, code):
     """Caption shown to users: same as channel caption, but without the #code."""
     cap = re.sub(r"\s*━+\s*🔖\s*#" + re.escape(code) + r"\b", "", cap, flags=re.I)
@@ -125,11 +269,15 @@ async def send_item(c, chat_id, it, code):
     # 1) copy from any saved channel location  2) fallback: send by file_id (same bot only)
     cap = public_caption(it["cap"], code)
     for chat, mid in it["l"]:
+        if dead_locs.get((chat, mid)):
+            continue
         try:
             return await retry(c.copy_message, chat_id, chat, mid, caption=cap,
                                parse_mode=ParseMode.HTML, protect_content=PROTECT)
+        except USER_ERRORS:
+            raise
         except Exception:
-            continue
+            dead_locs.set((chat, mid), True, 300)
     return await retry(c.send_cached_media, chat_id, it["f"],
                        caption=cap, parse_mode=ParseMode.HTML, protect_content=PROTECT)
 
@@ -137,21 +285,26 @@ async def send_item(c, chat_id, it, code):
 async def joined(c, uid):
     if not FORCE_SUB:
         return True
+    if member_cache.get(uid):
+        return True
     try:
         chat = int(FORCE_SUB) if FORCE_SUB.lstrip("-").isdigit() else FORCE_SUB
         mem = await c.get_chat_member(chat, uid)
-        return mem.status not in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT)
+        ok = mem.status not in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT)
+        if ok:
+            member_cache.set(uid, True, 120)
+        return ok
     except UserNotParticipant:
         return False
     except Exception:
         return True
 
 
-async def delete_later(msgs):
+async def delete_later(c, chat_id, ids):
     await asyncio.sleep(AUTO_DELETE)
-    for m in msgs:
+    for i in range(0, len(ids), 100):  # 100 messages per API call instead of 1
         try:
-            await m.delete()
+            await retry(c.delete_messages, chat_id, ids[i:i + 100])
         except Exception:
             pass
 
@@ -164,34 +317,48 @@ async def start(c, m):
     code = m.command[1].lower()
     if not re.fullmatch(r"[a-z0-9_-]{1,60}", code):
         return await m.reply("❌ Invalid link.")
-    if not await joined(c, m.from_user.id):
-        retry_url = f"https://t.me/{c.me.username}?start={code}"
-        join = FORCE_SUB_LINK or f"https://t.me/{FORCE_SUB.lstrip('@')}"
-        return await m.reply("🔒 Join the channel first, then tap Try again.",
-                             reply_markup=Markup([[Btn("Join channel", url=join)],
-                                                  [Btn("Try again", url=retry_url)]]))
+    uid = m.from_user.id
+    if uid in busy:  # same user spamming the link -> don't multiply the work
+        return await m.reply("⏳ Files already aa rahi hain, thoda ruko.")
+    busy.add(uid)
     try:
-        items = await get_items(code)
-    except Exception as e:
-        logging.error("worker error: %s", e)
-        return await m.reply("⚠️ Service error, try again later.")
-    if not items:
-        return await m.reply("❌ File not found.")
-    wait = await m.reply("⏳ Sending…")
-    sent = []
-    for it in items:
+        if not await joined(c, uid):
+            retry_url = f"https://t.me/{c.me.username}?start={code}"
+            join = FORCE_SUB_LINK or f"https://t.me/{FORCE_SUB.lstrip('@')}"
+            return await m.reply("🔒 Join the channel first, then tap Try again.",
+                                 reply_markup=Markup([[Btn("Join channel", url=join)],
+                                                      [Btn("Try again", url=retry_url)]]))
         try:
-            sent.append(await send_item(c, m.chat.id, it, code))
+            items = await get_items(code)
         except Exception as e:
-            logging.warning("send failed (%s): %s", code, e)
-    await wait.delete()
-    if not sent:
-        return await m.reply("❌ Files unavailable. Admin needs to run /restore.")
-    bump("dl")
-    bump("files", len(sent))
-    if AUTO_DELETE:
-        note = await m.reply(f"⚠️ Files auto-delete in {AUTO_DELETE // 60 or 1} min. Save them now.")
-        asyncio.create_task(delete_later(sent + [note]))
+            logging.error("worker error: %s", e)
+            return await m.reply("⚠️ Service error, try again later.")
+        if not items:
+            return await m.reply("❌ File not found.")
+        wait = await retry(m.reply, "⏳ Sending…")
+        sent = []
+        for it in items:
+            try:
+                sent.append(await send_item(c, m.chat.id, it, code))
+            except USER_ERRORS:
+                break  # user blocked the bot / account gone
+            except Exception as e:
+                logging.warning("send failed (%s): %s", code, e)
+        try:
+            await retry(wait.delete)
+        except Exception:
+            pass
+        if not sent:
+            return await m.reply("❌ Files unavailable. Admin needs to run /restore.")
+        bump("dl")
+        bump("files", len(sent))
+        if AUTO_DELETE:
+            note = await retry(m.reply, f"⚠️ Files auto-delete in {AUTO_DELETE // 60 or 1} min. Save them now.")
+            t = asyncio.create_task(delete_later(c, m.chat.id, [x.id for x in sent] + [note.id]))
+            bg_tasks.add(t)
+            t.add_done_callback(bg_tasks.discard)
+    finally:
+        busy.discard(uid)
 
 
 # ---------- admin side ----------
@@ -241,14 +408,19 @@ async def upload(c, m):
     if not cm:  # no #code -> bot makes code + nice caption (your text becomes the title)
         hint = cap.splitlines()[0][:100] if cap else None
         _, caption = make_caption(m, hint)
-    res = None
+    saved = []
     for ch in CHANNELS:
         try:
-            saved = await retry(m.copy, ch, caption=caption, parse_mode=ParseMode.HTML)
-            res = await index_message(saved) or res
+            saved.append(await retry(m.copy, ch, caption=caption, parse_mode=ParseMode.HTML))
         except Exception as e:
             logging.warning("copy to %s failed: %s", ch, e)
             await m.reply(f"⚠️ Channel {ch} mein save nahi hua (bot admin hai?)", quote=True)
+    res = None
+    if saved:
+        try:
+            res = await index_messages(saved)  # ONE index write for all channels
+        except Exception as e:
+            logging.error("index failed: %s", e)
     if not res:
         return await m.reply("❌ Save failed.", quote=True)
     code, n = res
@@ -260,7 +432,10 @@ async def upload(c, m):
 @app.on_message(filters.chat(CHANNELS) & media)
 async def channel_post(c, m):
     # files posted/forwarded straight into a DB/backup channel with #code get indexed too
-    res = await index_message(m)
+    try:
+        res = await index_messages([m])
+    except Exception as e:
+        return logging.error("channel index failed: %s", e)
     if res:
         logging.info("indexed from channel: %s", res)
 
@@ -275,7 +450,13 @@ async def delete_cmd(c, m):
 
 @app.on_message(filters.command("export") & filters.private & is_admin)
 async def export_cmd(c, m):
-    data = {code: await get_items(code) for code in await list_codes()}
+    sem = asyncio.Semaphore(20)
+
+    async def one(code):
+        async with sem:
+            return code, await get_items(code, fresh=True)
+
+    data = dict(await asyncio.gather(*[one(x) for x in await list_codes()]))
     f = io.BytesIO(json.dumps(data, indent=1).encode())
     f.name = "backup.json"
     await m.reply_document(f, caption=f"{len(data)} codes")
@@ -284,36 +465,43 @@ async def export_cmd(c, m):
 @app.on_message(filters.command("restore") & filters.private & is_admin)
 async def restore_cmd(c, m):
     """After changing DB_CHANNEL / BACKUP_CHANNEL env: fill every channel with all files."""
-    status = await m.reply("♻️ Restoring…")
-    ok = bad = 0
-    async with lock:
-        for code in await list_codes():
-            items = await get_items(code)
-            for it in items:
-                for target in CHANNELS:
-                    if any(x[0] == target for x in it["l"]):
-                        continue
-                    new_msg = None
-                    for chat, mid in it["l"]:
-                        try:
-                            new_msg = await retry(c.copy_message, target, chat, mid)
-                            break
-                        except Exception:
+    global restoring
+    if restoring:
+        return await m.reply("♻️ Restore already running.")
+    restoring = True
+    try:
+        status = await m.reply("♻️ Restoring…")
+        ok = bad = 0
+        for code in await list_codes():  # per-code lock: users & uploads keep working meanwhile
+            async with code_lock(code):
+                items = copy.deepcopy(await get_items(code, fresh=True))
+                for it in items:
+                    for target in CHANNELS:
+                        if any(x[0] == target for x in it["l"]):
                             continue
-                    if not new_msg:
-                        try:
-                            new_msg = await retry(c.send_cached_media, target, it["f"],
-                                                   caption=it["cap"], parse_mode=ParseMode.HTML)
-                        except Exception as e:
-                            bad += 1
-                            logging.warning("restore failed %s: %s", code, e)
-                            continue
-                    it["l"].append([new_msg.chat.id, new_msg.id])
-                    ok += 1
-                    await asyncio.sleep(1)
-                it["l"] = [x for x in it["l"] if x[0] in CHANNELS] or it["l"]
-            await put_items(code, items)
-    await status.edit(f"✅ Restored {ok}, failed {bad}")
+                        new_msg = None
+                        for chat, mid in it["l"]:
+                            try:
+                                new_msg = await retry(c.copy_message, target, chat, mid)
+                                break
+                            except Exception:
+                                continue
+                        if not new_msg:
+                            try:
+                                new_msg = await retry(c.send_cached_media, target, it["f"],
+                                                       caption=it["cap"], parse_mode=ParseMode.HTML)
+                            except Exception as e:
+                                bad += 1
+                                logging.warning("restore failed %s: %s", code, e)
+                                continue
+                        it["l"].append([new_msg.chat.id, new_msg.id])
+                        ok += 1
+                        await asyncio.sleep(1)
+                    it["l"] = [x for x in it["l"] if x[0] in CHANNELS] or it["l"]
+                await put_items(code, items)
+        await status.edit(f"✅ Restored {ok}, failed {bad}")
+    finally:
+        restoring = False
 
 
 GQL = """query($acc:String!,$s:Time!,$e:Time!,$d:Date!){viewer{accounts(filter:{accountTag:$acc}){
@@ -365,11 +553,12 @@ async def stats_cmd(c, m):
 
 async def main():
     global http
-    http = aiohttp.ClientSession()
+    http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=100, ttl_dns_cache=300),
+                                 timeout=aiohttp.ClientTimeout(total=15))
     await app.start()
     web_app = web.Application()
     web_app.add_routes([web.get("/", lambda r: web.Response(text="ok"))])
-    runner = web.AppRunner(web_app)
+    runner = web.AppRunner(web_app, access_log=None)  # no per-request log spam from health checks
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     try:
