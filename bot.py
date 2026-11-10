@@ -1,6 +1,6 @@
 import asyncio, base64, logging, os
 from aiohttp import web
-from pyrogram import Client, filters, idle
+from pyrogram import Client, ContinuePropagation, filters, idle
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import FloodWait, UserNotParticipant
 from pyrogram.types import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
@@ -128,6 +128,12 @@ async def upload(c, m):
         return await m.reply(f"➕ Added ({len(batches[m.from_user.id])})", quote=True)
     await m.reply(f"🔗 https://t.me/{c.me.username}?start={enc(saved.id, saved.id)}",
                   quote=True, disable_web_page_preview=True)
+
+
+@app.on_message(filters.all, group=-1)
+async def _debug(c, m):
+    logging.info("UPDATE from %s: %s", m.from_user.id if m.from_user else None, m.text or m.media)
+    raise ContinuePropagation
 
 
 async def main():
