@@ -8,8 +8,12 @@
 
 ## Usage
 - Admin sends a file to the bot → gets a share link.
-- `/batch` → send many files → `/done` → one link for all.
-- Anyone opening the link receives the files.
+- Admin opens the bot and taps **Start** (or sends any text) → **Admin Panel** with buttons.
+  No slash commands are needed:
+  - 📊 Stats · 📤 Export · 🗑 Delete Code · ♻️ Restore
+  - 🔍 Scan Source · 📋 Posts · 📅 Schedule · ⚡ Post Now · ❌ Clear Schedule
+    (scheduler buttons appear only when `SOURCE_CHANNEL` and `TARGET_CHANNEL` are set)
+- Anyone opening a share link receives the files.
 
 ## Deploy on Koyeb
 1. Push this folder to a GitHub repo.
