@@ -1,8 +1,8 @@
-import asyncio, io, json, logging, os, re
+import asyncio, html, io, json, logging, os, re, secrets, string
 import aiohttp
 from aiohttp import web
 from pyrogram import Client, filters, idle
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.errors import FloodWait, UserNotParticipant
 from pyrogram.types import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
 
@@ -79,8 +79,8 @@ def media_of(m):
 
 async def index_message(m):
     """Save message under its #code. Same file (unique id) -> one item with many locations."""
-    cap = m.caption or ""
-    cm, mi = CODE_RE.search(cap), media_of(m)
+    cap = m.caption.html if m.caption else ""
+    cm, mi = CODE_RE.search(m.caption or ""), media_of(m)
     if not cm or not mi:
         return None
     code = cm.group(1).lower()
@@ -101,15 +101,24 @@ async def index_message(m):
     return code, len(items)
 
 
-async def send_item(c, chat_id, it):
+def public_caption(cap, code):
+    """Caption shown to users: same as channel caption, but without the #code."""
+    cap = re.sub(r"\s*━+\s*🔖\s*#" + re.escape(code) + r"\b", "", cap, flags=re.I)
+    cap = re.sub(r"\s*#" + re.escape(code) + r"\b", "", cap, flags=re.I)
+    return cap.strip()
+
+
+async def send_item(c, chat_id, it, code):
     # 1) copy from any saved channel location  2) fallback: send by file_id (same bot only)
+    cap = public_caption(it["cap"], code)
     for chat, mid in it["l"]:
         try:
-            return await retry(c.copy_message, chat_id, chat, mid, protect_content=PROTECT)
+            return await retry(c.copy_message, chat_id, chat, mid, caption=cap,
+                               parse_mode=ParseMode.HTML, protect_content=PROTECT)
         except Exception:
             continue
     return await retry(c.send_cached_media, chat_id, it["f"],
-                       caption=it["cap"], protect_content=PROTECT)
+                       caption=cap, parse_mode=ParseMode.HTML, protect_content=PROTECT)
 
 
 async def joined(c, uid):
@@ -159,7 +168,7 @@ async def start(c, m):
     sent = []
     for it in items:
         try:
-            sent.append(await send_item(c, m.chat.id, it))
+            sent.append(await send_item(c, m.chat.id, it, code))
         except Exception as e:
             logging.warning("send failed (%s): %s", code, e)
     await wait.delete()
@@ -171,15 +180,56 @@ async def start(c, m):
 
 
 # ---------- admin side ----------
+EMOJI = {"video": "🎬", "photo": "🖼", "audio": "🎵", "document": "📄",
+         "animation": "🎞", "voice": "🎙", "video_note": "📹"}
+
+
+def human_size(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB":
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+
+
+def make_caption(m, title_hint=None):
+    """Auto code + stylish caption for a file sent without #code."""
+    kind = next(a for a in MEDIA_ATTRS if getattr(m, a, None))
+    obj = getattr(m, kind)
+    name = getattr(obj, "file_name", None)
+    title = title_hint or (re.sub(r"[._-]+", " ", os.path.splitext(name)[0]).strip().title()
+                           if name else kind.replace("_", " ").title())
+    title = (title or kind.title())[:100]
+    code = "".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(8))
+    info = []
+    if getattr(obj, "file_size", None):
+        info.append(f"📦 {human_size(obj.file_size)}")
+    d = getattr(obj, "duration", None)
+    if d:
+        info.append("⏱ " + (f"{d // 3600}:{d % 3600 // 60:02d}:{d % 60:02d}" if d >= 3600
+                            else f"{d // 60:02d}:{d % 60:02d}"))
+    if kind == "video" and getattr(obj, "height", None):
+        info.append(f"🎞 {obj.height}p")
+    lines = [f"{EMOJI[kind]} <b>{html.escape(title)}</b>", ""]
+    if info:
+        lines.append("  •  ".join(info))
+    lines += ["━━━━━━━━━━━━━━", f"🔖 #{code}"]
+    return code, "\n".join(lines)
+
+
 @app.on_message(filters.private & media & is_admin)
 async def upload(c, m):
-    cm = CODE_RE.search(m.caption or "")
-    if not cm or cm.group(1).startswith("__"):
-        return await m.reply("✏️ Caption mein #code likho, jaise #movie1", quote=True)
+    cap = (m.caption or "").strip()
+    cm = CODE_RE.search(cap)
+    caption = None
+    if cm and cm.group(1).startswith("__"):
+        return await m.reply("❌ Ye code allowed nahi hai.", quote=True)
+    if not cm:  # no #code -> bot makes code + nice caption (your text becomes the title)
+        hint = cap.splitlines()[0][:100] if cap else None
+        _, caption = make_caption(m, hint)
     res = None
     for ch in CHANNELS:
         try:
-            saved = await retry(m.copy, ch)
+            saved = await retry(m.copy, ch, caption=caption, parse_mode=ParseMode.HTML)
             res = await index_message(saved) or res
         except Exception as e:
             logging.warning("copy to %s failed: %s", ch, e)
@@ -236,7 +286,8 @@ async def restore_cmd(c, m):
                             continue
                     if not new_msg:
                         try:
-                            new_msg = await retry(c.send_cached_media, target, it["f"], caption=it["cap"])
+                            new_msg = await retry(c.send_cached_media, target, it["f"],
+                                                   caption=it["cap"], parse_mode=ParseMode.HTML)
                         except Exception as e:
                             bad += 1
                             logging.warning("restore failed %s: %s", code, e)
