@@ -323,6 +323,30 @@ async def delete_later(c, chat_id, ids):
             pass
 
 
+# ---------- welcome screen (plain /start for normal users): image + channel join buttons ----------
+START_IMAGE = os.environ.get("START_IMAGE", "").strip()   # https image URL or a Telegram file_id
+START_TEXT = os.environ.get("START_TEXT", "👋 Welcome!\n\nJoin our channels below, then open any video link to watch.").replace("\\n", "\n")
+START_CHANNELS = []   # [(button text, url)]
+for _part in os.environ.get("START_CHANNELS", "").split(","):   # "Name|https://t.me/x, Name2|https://t.me/y"
+    if "|" in _part:
+        _n, _u = _part.split("|", 1)
+        if _n.strip() and _u.strip().startswith("http"):
+            START_CHANNELS.append((_n.strip(), _u.strip()))
+
+
+async def send_welcome(m):
+    rows = [[Btn(f"📢 {n}", url=u)] for n, u in START_CHANNELS]
+    if PAY_READY:
+        rows.append([Btn("💎 Increase daily limit", callback_data="p:menu")])
+    mk = Markup(rows) if rows else None
+    if START_IMAGE:
+        try:
+            return await retry(m.reply_photo, START_IMAGE, caption=START_TEXT[:1000], reply_markup=mk)
+        except Exception as e:
+            logging.warning("welcome image failed: %s", e)
+    return await m.reply(START_TEXT, reply_markup=mk)
+
+
 # ---------- user side ----------
 @app.on_message(filters.command("start") & filters.private)
 async def start(c, m):
@@ -330,7 +354,7 @@ async def start(c, m):
         if m.from_user.id in ADMINS:  # admins get the button panel
             pending.pop(m.from_user.id, None)
             return await m.reply(menu_text(), reply_markup=menu_markup())
-        return await m.reply("👋 Send me a file link to get your files.")
+        return await send_welcome(m)
     code = m.command[1].lower()
     if not re.fullmatch(r"[a-z0-9_-]{1,60}", code):
         return await m.reply("❌ Invalid link.")
