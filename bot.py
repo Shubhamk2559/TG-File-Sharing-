@@ -569,8 +569,8 @@ except Exception:
 
 
 def _nl(text):
-    """'\\n' (and '/n' not followed by a letter) in the env value -> real new line."""
-    return re.sub(r"\\n|/n(?![A-Za-z])", "\n", text)
+    """'\\n' and '/n' in the env value -> real new line ('/n' inside words/URLs like t.me/news is kept)."""
+    return re.sub(r"\\n|(?<![A-Za-z0-9.])/n", "\n", text)
 
 
 POST_CAPTION = _nl(os.environ.get("POST_CAPTION", "🔥 New Video Uploaded!\\n\\nWatch now 👇"))
