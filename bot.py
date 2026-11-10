@@ -380,7 +380,7 @@ async def start(c, m):
         return await m.reply(f"⛔ Daily limit reached ({limit_for(uid)} videos per day). " + reset_text()
                              + ("\n\n💎 Need more? Increase your limit instantly with UPI." if limit_markup(uid) else ""),
                              reply_markup=limit_markup(uid))
-    if ads["on"] and not (ADMINS_SKIP_ADS and uid in ADMINS):
+    if ads["on"] and not (ADMINS_SKIP_ADS and uid in ADMINS) and not is_premium(uid):  # paid users: no ads
         text = "🔒 Watch a short ad to unlock your files."
         if len(items) > left:
             text += f"\n\nYou have {left} video(s) left today, so you will receive the first {left}."
@@ -695,6 +695,11 @@ def limit_for(uid):
     if e and e[1] > time.time():
         return max(DAILY_LIMIT, e[0])
     return DAILY_LIMIT
+
+
+def is_premium(uid):
+    e = premium["u"].get(uid)
+    return bool(e and e[1] > time.time())
 
 
 def limit_markup(uid):
