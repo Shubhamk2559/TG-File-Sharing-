@@ -737,22 +737,32 @@ def new_code():
 
 
 async def publish_next(c):
-    """Next unposted post -> share link (KV write) -> post in TARGET_CHANNEL. None if nothing left."""
+    """Next unposted post: save its CAPTION-LESS videos into DB_CHANNEL (+backup) under a new code,
+    index the code, then post the captioned video in TARGET_CHANNEL with the link button.
+    Returns (code, n_videos, link), or None if nothing is left. Safe to retry after a failure."""
     posted = set(sched["posted"])
     grp = next((g for g in lib if g["i"] not in posted), None)
     if not grp:
         return None
-    code = made_codes.get(grp["i"])
-    if not code:
-        code, seen, items = new_code(), set(), []
-        for n, (mid, fid, uid) in enumerate(grp["v"]):
-            if uid in seen:
-                continue
-            seen.add(uid)
-            items.append({"u": uid, "f": fid, "cap": grp["c"] if n == 0 else "",
-                          "l": [[SOURCE_CHANNEL, mid]]})
-        await put_items(code, items)
-        made_codes[grp["i"]] = code
+    st = made_codes.get(grp["i"])
+    if st is None:
+        vids = grp["v"][1:] or grp["v"]  # link = caption-less videos only (lone captioned video: fallback)
+        seen, uniq = set(), []
+        for v in vids:
+            if v[2] not in seen:
+                seen.add(v[2])
+                uniq.append(v)
+        st = made_codes[grp["i"]] = {"code": new_code(), "n": len(uniq), "saved": [], "indexed": False,
+                                     "todo": [(v[0], ch) for v in uniq for ch in CHANNELS]}
+    code = st["code"]
+    while st["todo"]:  # copy into the database channel(s); progress is kept if something fails midway
+        mid, ch = st["todo"][0]
+        st["saved"].append(await retry(c.copy_message, ch, SOURCE_CHANNEL, mid, caption=f"🔖 #{code}"))
+        st["todo"].pop(0)
+    if not st["indexed"]:
+        if not await index_messages(st["saved"]):  # ONE KV write for the whole post
+            raise RuntimeError("code index save nahi hua")
+        st["indexed"], st["saved"] = True, []
     link = (f"https://t.me/{c.me.username}?start={code}" if POST_LINK_BOT
             else f"{WORKER_URL}/{code}")
     # link lives ONLY inside the button (never in the caption text)
@@ -760,7 +770,7 @@ async def publish_next(c):
                 parse_mode=ParseMode.HTML, reply_markup=Markup([[Btn(BUTTON_TEXT, url=link)]]))
     sched["posted"].append(grp["i"])
     made_codes.pop(grp["i"], None)
-    return code, len(grp["v"]), link
+    return code, st["n"], link
 
 
 async def notify_admins(c, text):
