@@ -32,3 +32,12 @@ Update later: `git pull && docker compose up -d --build`
 ## Notes
 - Don't run the same bot token on Koyeb and Contabo at once. Use one, keep the other as backup.
 - Links are obfuscated with `SALT`; change it and old links break.
+
+## Performance (high traffic)
+- Links are cached in RAM (`CACHE_TTL`, default 300s) and simultaneous opens of the same link share one Cloudflare KV read.
+- All Telegram sends go through one shared rate limiter (`SEND_RATE`, default 25/s) so FloodWait doesn't cascade.
+- `WORKERS` = how many users are served in parallel (default 100).
+- Uploads write to KV once (not once per channel); unchanged re-indexes write nothing.
+- Auto-delete removes up to 100 messages per API call.
+- Blocked/deleted users are skipped immediately; failing channel locations are skipped for 5 min.
+- Docker image is smaller (no compiler) and logs are size-limited.
