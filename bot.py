@@ -17,8 +17,8 @@ from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram import errors as tg_errors
 from pyrogram.enums import ChatMemberStatus, ParseMode
-from pyrogram.errors import FloodWait, UserNotParticipant
-from pyrogram.types import InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
+from pyrogram.errors import FloodWait, MessageNotModified, UserNotParticipant
+from pyrogram.types import CallbackQuery, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)  # less log I/O under load
@@ -315,13 +315,16 @@ async def delete_later(c, chat_id, ids):
 @app.on_message(filters.command("start") & filters.private)
 async def start(c, m):
     if len(m.command) < 2:
+        if m.from_user.id in ADMINS:  # admins get the button panel
+            pending.pop(m.from_user.id, None)
+            return await m.reply(MENU_TEXT, reply_markup=menu_markup())
         return await m.reply("👋 Send me a file link to get your files.")
     code = m.command[1].lower()
     if not re.fullmatch(r"[a-z0-9_-]{1,60}", code):
         return await m.reply("❌ Invalid link.")
     uid = m.from_user.id
     if uid in busy:  # same user spamming the link -> don't multiply the work
-        return await m.reply("⏳ Files already aa rahi hain, thoda ruko.")
+        return await m.reply("⏳ Your files are already being sent. Please wait.")
     busy.add(uid)
     try:
         if not await joined(c, uid):
@@ -351,7 +354,7 @@ async def start(c, m):
         except Exception:
             pass
         if not sent:
-            return await m.reply("❌ Files unavailable. Admin needs to run /restore.")
+            return await m.reply("❌ Files unavailable. Please contact the admin.")
         bump("dl")
         bump("files", len(sent))
         if AUTO_DELETE:
@@ -406,7 +409,7 @@ async def upload(c, m):
     cm = CODE_RE.search(cap)
     caption = None
     if cm and cm.group(1).startswith("__"):
-        return await m.reply("❌ Ye code allowed nahi hai.", quote=True)
+        return await m.reply("❌ This code is not allowed.", quote=True)
     if not cm:  # no #code -> bot makes code + nice caption (your text becomes the title)
         hint = cap.splitlines()[0][:100] if cap else None
         _, caption = make_caption(m, hint)
@@ -416,7 +419,7 @@ async def upload(c, m):
             saved.append(await retry(m.copy, ch, caption=caption, parse_mode=ParseMode.HTML))
         except Exception as e:
             logging.warning("copy to %s failed: %s", ch, e)
-            await m.reply(f"⚠️ Channel {ch} mein save nahi hua (bot admin hai?)", quote=True)
+            await m.reply(f"⚠️ Could not save to channel {ch}. Is the bot an admin there?", quote=True)
     res = None
     if saved:
         try:
@@ -428,7 +431,8 @@ async def upload(c, m):
     code, n = res
     bump("up")
     await m.reply(f"✅ #{code} ({n} file{'s' if n > 1 else ''})\n🔗 {WORKER_URL}/{code}",
-                  quote=True, disable_web_page_preview=True)
+                  quote=True, disable_web_page_preview=True,
+                  reply_markup=Markup([[Btn("🛠 Menu", callback_data="a:menunew")]]))
 
 
 @app.on_message(filters.chat(CHANNELS) & media)
@@ -440,70 +444,6 @@ async def channel_post(c, m):
         return logging.error("channel index failed: %s", e)
     if res:
         logging.info("indexed from channel: %s", res)
-
-
-@app.on_message(filters.command("delete") & filters.private & is_admin)
-async def delete_cmd(c, m):
-    if len(m.command) < 2:
-        return await m.reply("Usage: /delete code")
-    await del_code(m.command[1].lower().lstrip("#"))
-    await m.reply("🗑 Deleted from index.")
-
-
-@app.on_message(filters.command("export") & filters.private & is_admin)
-async def export_cmd(c, m):
-    sem = asyncio.Semaphore(20)
-
-    async def one(code):
-        async with sem:
-            return code, await get_items(code, fresh=True)
-
-    data = dict(await asyncio.gather(*[one(x) for x in await list_codes()]))
-    f = io.BytesIO(json.dumps(data, indent=1).encode())
-    f.name = "backup.json"
-    await m.reply_document(f, caption=f"{len(data)} codes")
-
-
-@app.on_message(filters.command("restore") & filters.private & is_admin)
-async def restore_cmd(c, m):
-    """After changing DB_CHANNEL / BACKUP_CHANNEL env: fill every channel with all files."""
-    global restoring
-    if restoring:
-        return await m.reply("♻️ Restore already running.")
-    restoring = True
-    try:
-        status = await m.reply("♻️ Restoring…")
-        ok = bad = 0
-        for code in await list_codes():  # per-code lock: users & uploads keep working meanwhile
-            async with code_lock(code):
-                items = copy.deepcopy(await get_items(code, fresh=True))
-                for it in items:
-                    for target in CHANNELS:
-                        if any(x[0] == target for x in it["l"]):
-                            continue
-                        new_msg = None
-                        for chat, mid in it["l"]:
-                            try:
-                                new_msg = await retry(c.copy_message, target, chat, mid)
-                                break
-                            except Exception:
-                                continue
-                        if not new_msg:
-                            try:
-                                new_msg = await retry(c.send_cached_media, target, it["f"],
-                                                       caption=it["cap"], parse_mode=ParseMode.HTML)
-                            except Exception as e:
-                                bad += 1
-                                logging.warning("restore failed %s: %s", code, e)
-                                continue
-                        it["l"].append([new_msg.chat.id, new_msg.id])
-                        ok += 1
-                        await asyncio.sleep(1)
-                    it["l"] = [x for x in it["l"] if x[0] in CHANNELS] or it["l"]
-                await put_items(code, items)
-        await status.edit(f"✅ Restored {ok}, failed {bad}")
-    finally:
-        restoring = False
 
 
 GQL = """query($acc:String!,$s:Time!,$e:Time!,$d:Date!){viewer{accounts(filter:{accountTag:$acc}){
@@ -518,39 +458,13 @@ def fmt_cf(acc):
     for x in acc.get("k", []):
         a = x["dimensions"]["actionType"]
         kv[a] = kv.get(a, 0) + x["sum"]["requests"]
-    return (f"☁️ Cloudflare (aaj, UTC)\n"
+    return (f"☁️ Cloudflare (today, UTC)\n"
             f"🌐 Worker requests: {wreq:,} / 100,000\n"
             f"📖 KV reads: {kv.get('read', 0):,} / 100,000\n"
             f"✍️ KV writes: {kv.get('write', 0):,} / 1,000\n"
             f"🗑 KV deletes: {kv.get('delete', 0):,} / 1,000\n"
             f"📋 KV lists: {kv.get('list', 0):,} / 1,000")
 
-
-@app.on_message(filters.command("stats") & filters.private & is_admin)
-async def stats_cmd(c, m):
-    bump("dl", 0)  # rolls the day over if needed
-    text = (f"📊 Stats ({stat['day']} UTC)\n\n"
-            f"🤖 Bot (restart ke baad se)\n"
-            f"⬇️ Downloads: {stat['dl']} ({stat['files']} files)\n"
-            f"⬆️ Uploads: {stat['up']}\n\n")
-    if CF_ACCOUNT_ID and CF_API_TOKEN:
-        now = datetime.now(timezone.utc)
-        v = {"acc": CF_ACCOUNT_ID, "d": now.strftime("%Y-%m-%d"),
-             "s": now.strftime("%Y-%m-%dT00:00:00Z"), "e": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
-        try:
-            async with http.post("https://api.cloudflare.com/client/v4/graphql",
-                                 headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
-                                 json={"query": GQL, "variables": v}) as r:
-                data = await r.json()
-            if data.get("errors"):
-                text += "⚠️ Cloudflare: " + str(data["errors"][0].get("message"))[:200]
-            else:
-                text += fmt_cf(data["data"]["viewer"]["accounts"][0])
-        except Exception as e:
-            text += f"⚠️ Cloudflare stats error: {e}"
-    else:
-        text += "☁️ Exact Cloudflare numbers ke liye CF_ACCOUNT_ID aur CF_API_TOKEN set karo."
-    await m.reply(text)
 
 
 # ======================================================================
@@ -584,10 +498,10 @@ scan_lock = asyncio.Lock()
 made_codes = {}     # group id -> code already written (a retry doesn't write again)
 
 SCHEDULE_HELP = (
-    "📅 /schedule examples:\n"
-    "• /schedule 10:00 14:00 18:30  → har time pe 1 post\n"
-    "• /schedule 6 10:00 2h  → 10:00 se shuru, har 2 ghante me, total 6 posts\n"
-    "• /schedule 2026-11-12 10:00 14:00  → us date ke liye\n"
+    "📅 Send your times, for example:\n"
+    "• 10:00 14:00 18:30  → one post at each time\n"
+    "• 6 10:00 2h  → 6 posts, starting at 10:00, every 2 hours\n"
+    "• 2026-11-12 10:00 14:00  → same, but on that date\n"
     f"Timezone: {TZ}")
 
 
@@ -696,35 +610,35 @@ def parse_schedule(args):
             try:
                 day = datetime.strptime(a, "%Y-%m-%d")
             except ValueError:
-                raise ValueError(f"galat date: {a}")
+                raise ValueError(f"Invalid date: {a}")
         elif re.fullmatch(r"\d{1,2}:\d{2}", a):
             h, mi = map(int, a.split(":"))
             if h > 23 or mi > 59:
-                raise ValueError(f"galat time: {a}")
+                raise ValueError(f"Invalid time: {a}")
             times.append((h, mi))
         elif re.fullmatch(r"\d+[mh]", a):
             interval = int(a[:-1]) * (60 if a[-1] == "m" else 3600)
         elif a.isdigit():
             count = int(a)
         else:
-            raise ValueError(f"samajh nahi aaya: {a}")
+            raise ValueError(f"Could not understand: {a}")
     if not times:
-        raise ValueError("Time do, jaise 18:30")
+        raise ValueError("Please give a time, for example 18:30")
 
     def at(h, mi):
         if day:
             dt = day.replace(hour=h, minute=mi, tzinfo=TZ)
             if dt <= now:
-                raise ValueError(f"{dt:%d %b %H:%M} ka time nikal chuka hai")
+                raise ValueError(f"{dt:%d %b %H:%M} has already passed")
             return dt
         dt = now.replace(hour=h, minute=mi, second=0, microsecond=0)
         return dt if dt > now else dt + timedelta(days=1)
 
     if count is not None or interval is not None:
         if len(times) != 1 or not count or not interval:
-            raise ValueError("Format: /schedule 6 10:00 2h  (count, start time, gap)")
+            raise ValueError("Format: 6 10:00 2h  (count, start time, gap)")
         if interval < 60 or count > 500:
-            raise ValueError("Gap kam se kam 1m aur count max 500")
+            raise ValueError("Gap must be at least 1m and count at most 500")
         start = at(*times[0])
         stamps = [start + timedelta(seconds=interval * i) for i in range(count)]
     else:
@@ -761,7 +675,7 @@ async def publish_next(c):
         st["todo"].pop(0)
     if not st["indexed"]:
         if not await index_messages(st["saved"]):  # ONE KV write for the whole post
-            raise RuntimeError("code index save nahi hua")
+            raise RuntimeError("could not save the code index")
         st["indexed"], st["saved"] = True, []
     link = (f"https://t.me/{c.me.username}?start={code}" if POST_LINK_BOT
             else f"{WORKER_URL}/{code}")
@@ -796,15 +710,15 @@ async def run_due(c):
                 logging.error("scheduled post failed: %s", e)
                 if ent[1] >= 3:
                     q.pop(0)
-                    note = f"❌ {fmt_ts(ent[0])} wala post 3 baar fail hua, hata diya.\n{e}\n(Bot TARGET channel me admin hai?)"
+                    note = f"❌ The post scheduled for {fmt_ts(ent[0])} failed 3 times and was removed.\n{e}\n(Is the bot an admin in the TARGET channel?)"
                 else:
                     ent[0] = int(time.time()) + 300
                     q.sort()
-                    note = f"⚠️ Scheduled post fail hua: {e}\n5 min baad dobara try karunga."
+                    note = f"⚠️ Scheduled post failed: {e}\nRetrying in 5 minutes."
             else:
                 q.pop(0)
                 if res is None:
-                    note = "📭 Scheduled time aaya par koi unposted post nahi bacha. /scan se naye posts lao."
+                    note = "📭 A scheduled time arrived but no unposted posts are left. Open the panel and scan for new posts."
             await persist("sched")
         if note:
             await notify_admins(c, note)
@@ -823,36 +737,196 @@ async def scheduler(c):
         await asyncio.sleep(5)
 
 
-async def feature_ready(m):
+# ======================================================================
+#  ADMIN PANEL - everything is done with buttons (no slash commands needed)
+# ======================================================================
+pending = {}   # admin id -> {"a": action, "text": waiting for typed input?, "ts": time, ...}
+PENDING_TTL = 600
+
+
+def _awaiting(_, __, m):
+    st = pending.get(m.from_user.id) if m.from_user else None
+    if not st:
+        return False
+    if time.time() - st["ts"] > PENDING_TTL:
+        pending.pop(m.from_user.id, None)
+        return False
+    return bool(st["text"])
+
+
+awaiting_input = filters.create(_awaiting)
+
+
+def set_state(uid, action, text=False, **kw):
+    pending[uid] = {"a": action, "text": text, "ts": time.time(), **kw}
+
+
+def kb(*rows):
+    return Markup([[Btn(t, callback_data=d) for t, d in row] for row in rows])
+
+
+BACK = kb([("⬅️ Menu", "a:menu")])
+CANCEL = kb([("✖️ Cancel", "a:menu")])
+MENU_TEXT = ("🛠 <b>Admin Panel</b>\n\n"
+             "Send any file to this chat to get a share link.\n"
+             "Use the buttons below for everything else.")
+GAPS = [("30 min", "30m"), ("1 hour", "1h"), ("2 hours", "2h"),
+        ("3 hours", "3h"), ("6 hours", "6h"), ("12 hours", "12h")]
+GAP_LABEL = {v: k for k, v in GAPS}
+COUNTS = [5, 10, 20, 30, 50, 100]
+
+
+def menu_markup():
+    rows = [[("📊 Stats", "a:stats"), ("📤 Export", "a:export")],
+            [("🗑 Delete Code", "a:del"), ("♻️ Restore", "a:restore")]]
+    if feature_on():
+        rows += [[("🔍 Scan Source", "a:scan"), ("📋 Posts", "a:posts")],
+                 [("📅 Schedule", "a:sch"), ("⚡ Post Now", "a:now")],
+                 [("❌ Clear Schedule", "a:clr")]]
+    return kb(*rows)
+
+
+def plural(n, word="file"):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+async def show(x, text, markup=None):
+    """Button press -> edit the panel message. Typed message -> send a new one."""
+    try:
+        if isinstance(x, CallbackQuery):
+            return await retry(x.message.edit_text, text, reply_markup=markup,
+                               disable_web_page_preview=True)
+        return await retry(x.reply, text, reply_markup=markup,
+                           disable_web_page_preview=True, quote=True)
+    except MessageNotModified:
+        return x.message
+
+
+async def upd(msg, text, markup=None):
+    try:
+        return await retry(msg.edit_text, text, reply_markup=markup, disable_web_page_preview=True)
+    except MessageNotModified:
+        return msg
+
+
+async def feature_ready(x):
     if not feature_on():
-        await m.reply("⚠️ SOURCE_CHANNEL aur TARGET_CHANNEL env set karo.")
+        await show(x, "⚠️ Set the SOURCE_CHANNEL and TARGET_CHANNEL env variables first.", BACK)
         return False
     if not await load_sched():
-        await m.reply("⚠️ Worker se data load nahi hua, thodi der baad try karo.")
+        await show(x, "⚠️ Could not load data from the worker. Please try again in a moment.", BACK)
         return False
     return True
 
 
-@app.on_message(filters.command("scan") & filters.private & is_admin)
-async def scan_cmd(c, m):
-    """Read SOURCE_CHANNEL history by message id and build posts. /scan  |  /scan from  |  /scan from to"""
-    if not await feature_ready(m):
+# ---------- stats ----------
+async def build_stats():
+    bump("dl", 0)  # rolls the day over if needed
+    text = (f"📊 Stats ({stat['day']} UTC)\n\n"
+            f"🤖 Bot (since last restart)\n"
+            f"⬇️ Downloads: {stat['dl']} ({stat['files']} files)\n"
+            f"⬆️ Uploads: {stat['up']}\n\n")
+    if CF_ACCOUNT_ID and CF_API_TOKEN:
+        now = datetime.now(timezone.utc)
+        v = {"acc": CF_ACCOUNT_ID, "d": now.strftime("%Y-%m-%d"),
+             "s": now.strftime("%Y-%m-%dT00:00:00Z"), "e": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        try:
+            async with http.post("https://api.cloudflare.com/client/v4/graphql",
+                                 headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
+                                 json={"query": GQL, "variables": v}) as r:
+                data = await r.json()
+            if data.get("errors"):
+                text += "⚠️ Cloudflare: " + str(data["errors"][0].get("message"))[:200]
+            else:
+                text += fmt_cf(data["data"]["viewer"]["accounts"][0])
+        except Exception as e:
+            text += f"⚠️ Cloudflare stats error: {e}"
+    else:
+        text += "☁️ Set CF_ACCOUNT_ID and CF_API_TOKEN to see exact Cloudflare numbers."
+    return text
+
+
+# ---------- export / restore ----------
+async def do_export(c, x):
+    await show(x, "📤 Preparing backup…")
+    sem = asyncio.Semaphore(20)
+
+    async def one(code):
+        async with sem:
+            return code, await get_items(code, fresh=True)
+
+    try:
+        data = dict(await asyncio.gather(*[one(k) for k in await list_codes()]))
+        f = io.BytesIO(json.dumps(data, indent=1).encode())
+        f.name = "backup.json"
+        chat_id = x.message.chat.id if isinstance(x, CallbackQuery) else x.chat.id
+        await retry(c.send_document, chat_id, f, caption=f"{len(data)} codes")
+        await show(x, MENU_TEXT, menu_markup())
+    except Exception as e:
+        logging.error("export failed: %s", e)
+        await show(x, f"❌ Export failed: {e}", BACK)
+
+
+async def run_restore(c, status):
+    """After changing DB_CHANNEL / BACKUP_CHANNEL env: fill every channel with all files."""
+    global restoring
+    if restoring:
+        return await upd(status, "♻️ A restore is already running.", BACK)
+    restoring = True
+    try:
+        await upd(status, "♻️ Restoring… this can take a while.")
+        ok = bad = 0
+        for code in await list_codes():  # per-code lock: users & uploads keep working meanwhile
+            async with code_lock(code):
+                items = copy.deepcopy(await get_items(code, fresh=True))
+                for it in items:
+                    for target in CHANNELS:
+                        if any(x[0] == target for x in it["l"]):
+                            continue
+                        new_msg = None
+                        for chat, mid in it["l"]:
+                            try:
+                                new_msg = await retry(c.copy_message, target, chat, mid)
+                                break
+                            except Exception:
+                                continue
+                        if not new_msg:
+                            try:
+                                new_msg = await retry(c.send_cached_media, target, it["f"],
+                                                      caption=it["cap"], parse_mode=ParseMode.HTML)
+                            except Exception as e:
+                                bad += 1
+                                logging.warning("restore failed %s: %s", code, e)
+                                continue
+                        it["l"].append([new_msg.chat.id, new_msg.id])
+                        ok += 1
+                        await asyncio.sleep(1)
+                    it["l"] = [x for x in it["l"] if x[0] in CHANNELS] or it["l"]
+                await put_items(code, items)
+        await upd(status, f"✅ Restored {ok}, failed {bad}", BACK)
+    except Exception as e:
+        logging.error("restore failed: %s", e)
+        await upd(status, f"❌ Restore failed: {e}", BACK)
+    finally:
+        restoring = False
+
+
+# ---------- scheduled posts ----------
+async def run_scan(c, x, args):
+    """Read SOURCE_CHANNEL history by message id and build posts. args = [] | [from] | [from, to]"""
+    if not await feature_ready(x):
         return
     if scan_lock.locked():
-        return await m.reply("🔍 Scan already chal raha hai.")
+        return await show(x, "🔍 A scan is already running.", BACK)
     async with scan_lock:
-        try:
-            args = [int(x) for x in m.command[1:3]]
-        except ValueError:
-            return await m.reply("Usage: /scan   ya   /scan from_id   ya   /scan from_id to_id")
-        status = await m.reply("🔍 Scanning…")
+        status = await show(x, "🔍 Scanning…")
         try:
             hi = args[1] if len(args) > 1 else await last_msg_id(c)
             lo = max(args[0] if args else sched["last"] + 1, 1)
             if hi < lo:
-                return await status.edit("✅ Naya kuch nahi hai (pehle se scanned).")
+                return await upd(status, "✅ Nothing new (already scanned).", BACK)
             if hi - lo > 200000:
-                return await status.edit("❌ Range bahut badi hai (max 200000 ids).")
+                return await upd(status, "❌ Range is too large (max 200000 ids).", BACK)
             known = {x[0] for g in lib for x in g["v"]}
             posted = set(sched["posted"])
             before = sum(len(g["v"]) for g in lib)
@@ -866,7 +940,8 @@ async def scan_cmd(c, m):
                 orphans += o
         except Exception as e:
             logging.error("scan failed: %s", e)
-            return await status.edit(f"❌ Scan fail: {e}\nBot SOURCE channel me admin hai? Manual: /scan 1 5000")
+            return await upd(status, f"❌ Scan failed: {e}\nIs the bot an admin in the SOURCE channel? "
+                                     "You can also try a custom range.", BACK)
         async with sched_lock:
             lib.extend(new)
             lib.sort(key=lambda g: g["i"])
@@ -875,20 +950,14 @@ async def scan_cmd(c, m):
             vids = sum(len(g["v"]) for g in lib) - before
             posted = set(sched["posted"])
             left = sum(1 for g in lib if g["i"] not in posted)
-        await status.edit(f"✅ Scan complete (id {lo}–{hi})\n🆕 Naye posts: {len(new)}\n🎬 Naye videos: {vids}\n"
-                          f"⏭ Bina caption ke orphan videos (skip): {orphans}\n"
+        await upd(status, f"✅ Scan complete (id {lo}–{hi})\n🆕 New posts: {len(new)}\n🎬 New videos: {vids}\n"
+                          f"⏭ Skipped videos without a captioned video above them: {orphans}\n"
                           f"📦 Total posts: {len(lib)} | Unposted: {left}"
-                          + ("" if ok else "\n⚠️ Worker save fail, auto-retry chalega."))
+                          + ("" if ok else "\n⚠️ Saving to the worker failed, it will retry automatically."),
+                  BACK)
 
 
-@app.on_message(filters.command("schedule") & filters.private & is_admin)
-async def schedule_cmd(c, m):
-    if not await feature_ready(m):
-        return
-    try:
-        stamps = parse_schedule(m.command[1:])
-    except ValueError as e:
-        return await m.reply(f"❌ {e}\n\n{SCHEDULE_HELP}")
+async def apply_schedule(x, stamps):
     async with sched_lock:
         sched["queue"] += [[t, 0] for t in stamps]
         sched["queue"].sort()
@@ -896,18 +965,17 @@ async def schedule_cmd(c, m):
         posted = set(sched["posted"])
         left = sum(1 for g in lib if g["i"] not in posted)
         total = len(sched["queue"])
-    lines = [f"✅ {len(stamps)} post schedule hue ({fmt_ts(stamps[0])} se {fmt_ts(stamps[-1])})"]
+    lines = [f"✅ {plural(len(stamps), 'post')} scheduled ({fmt_ts(stamps[0])} to {fmt_ts(stamps[-1])})"]
     lines += [f"• {fmt_ts(t)}" for t in stamps[:15]] + (["…"] if len(stamps) > 15 else [])
     if total > left:
-        lines.append(f"\n⚠️ Queue me {total} hain par unposted posts sirf {left}. /scan se aur lao.")
+        lines.append(f"\n⚠️ {total} in the queue but only {left} unposted posts. Scan for more.")
     if not ok:
-        lines.append("⚠️ Worker save fail, auto-retry chalega.")
-    await m.reply("\n".join(lines))
+        lines.append("⚠️ Saving to the worker failed, it will retry automatically.")
+    await show(x, "\n".join(lines), BACK)
 
 
-@app.on_message(filters.command("posts") & filters.private & is_admin)
-async def posts_cmd(c, m):
-    if not await feature_ready(m):
+async def do_posts(x):
+    if not await feature_ready(x):
         return
     posted = set(sched["posted"])
     done = sum(1 for g in lib if g["i"] in posted)
@@ -916,34 +984,210 @@ async def posts_cmd(c, m):
             f"✅ Posted: {done}\n🕓 Unposted: {len(lib) - done}\n⏰ Scheduled: {len(q)}")
     if q:
         text += "\n\n" + "\n".join(f"• {fmt_ts(t)}" for t, _ in q[:15]) + ("\n…" if len(q) > 15 else "")
-    await m.reply(text)
+    await show(x, text, kb([("🔍 Scan Source", "a:scan"), ("📅 Schedule", "a:sch")],
+                           [("⬅️ Menu", "a:menu")]))
 
 
-@app.on_message(filters.command("unschedule") & filters.private & is_admin)
-async def unschedule_cmd(c, m):
-    if not await feature_ready(m):
-        return
-    async with sched_lock:
-        n = len(sched["queue"])
-        sched["queue"] = []
-        await persist("sched")
-    await m.reply(f"🗑 {n} scheduled post cancel kar diye.")
-
-
-@app.on_message(filters.command("postnow") & filters.private & is_admin)
-async def postnow_cmd(c, m):
+async def do_postnow(c, x):
     """Post the next unposted post right now (test)."""
-    if not await feature_ready(m):
+    if not await feature_ready(x):
         return
+    await show(x, "⏳ Posting…")
     async with sched_lock:
         try:
             res = await publish_next(c)
         except Exception as e:
-            return await m.reply(f"❌ Post fail: {e}\n(Bot TARGET channel me admin hai?)")
+            return await show(x, f"❌ Post failed: {e}\n(Is the bot an admin in the TARGET channel?)", BACK)
         if res is None:
-            return await m.reply("📭 Koi unposted post nahi bacha. /scan karo.")
+            return await show(x, "📭 No unposted posts left. Scan the source channel first.",
+                              kb([("🔍 Scan Source", "a:scan")], [("⬅️ Menu", "a:menu")]))
         await persist("sched")
-    await m.reply(f"✅ Posted: #{res[0]} ({res[1]} videos)\n🔗 {res[2]}", disable_web_page_preview=True)
+    await show(x, f"✅ Posted: #{res[0]} ({plural(res[1], 'video')})\n🔗 {res[2]}", BACK)
+
+
+def start_time(when):
+    now = datetime.now(TZ)
+    t = now + timedelta(minutes=5) if when == "5m" else (now + timedelta(hours=1)).replace(minute=0)
+    return f"{t:%H:%M}"
+
+
+async def schedule_from_args(x, args):
+    try:
+        stamps = parse_schedule(args)
+    except ValueError as e:
+        return await show(x, f"❌ {e}\n\n{SCHEDULE_HELP}", CANCEL)
+    pending.pop(x.from_user.id, None)
+    await apply_schedule(x, stamps)
+
+
+# ---------- button presses ----------
+@app.on_callback_query(filters.regex(r"^a:") & is_admin)
+async def panel(c, q):
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    uid = q.from_user.id
+    parts = q.data[2:].split(":")
+    act = parts[0]
+
+    if act in ("menu", "cancel"):
+        pending.pop(uid, None)
+        return await show(q, MENU_TEXT, menu_markup())
+    if act == "menunew":
+        pending.pop(uid, None)
+        return await retry(q.message.reply, MENU_TEXT, reply_markup=menu_markup())
+
+    if act == "stats":
+        return await show(q, await build_stats(), kb([("🔄 Refresh", "a:stats"), ("⬅️ Menu", "a:menu")]))
+    if act == "export":
+        return await do_export(c, q)
+
+    if act == "del":
+        set_state(uid, "del", text=True)
+        return await show(q, "🗑 Send the code you want to delete (for example: abc123xy).", CANCEL)
+    if act == "delok":
+        st = pending.pop(uid, None)
+        if not st or st["a"] != "delok":
+            return await show(q, MENU_TEXT, menu_markup())
+        try:
+            await del_code(st["code"])
+        except Exception as e:
+            return await show(q, f"❌ Delete failed: {e}", BACK)
+        return await show(q, f"🗑 #{st['code']} deleted from the index.", BACK)
+
+    if act == "restore":
+        return await show(q, "♻️ Restore copies every saved file into the current DB / backup channels.\n"
+                             "This can take a long time. Continue?",
+                          kb([("✅ Yes, restore", "a:restoreok"), ("✖️ Cancel", "a:menu")]))
+    if act == "restoreok":
+        if restoring:
+            return await show(q, "♻️ A restore is already running.", BACK)
+        t = asyncio.create_task(run_restore(c, q.message))
+        bg_tasks.add(t)
+        t.add_done_callback(bg_tasks.discard)
+        return
+
+    if act == "scan":
+        if not await feature_ready(q):
+            return
+        return await show(q, "🔍 Scan the source channel for new videos.\n\n"
+                             "“New videos” continues from the last scanned message.",
+                          kb([("🔍 Scan new videos", "a:scannew")],
+                             [("🎯 Custom range", "a:scanrng")],
+                             [("⬅️ Menu", "a:menu")]))
+    if act == "scannew":
+        return await run_scan(c, q, [])
+    if act == "scanrng":
+        set_state(uid, "scanrng", text=True)
+        return await show(q, "🎯 Send the message ID range:\n• 1 5000  → from id 1 to id 5000\n"
+                             "• 300  → from id 300 to the newest message", CANCEL)
+
+    if act == "posts":
+        return await do_posts(q)
+    if act == "now":
+        return await do_postnow(c, q)
+
+    if act == "sch":
+        if not await feature_ready(q):
+            return
+        return await show(q, f"📅 Schedule posts\nTimezone: {TZ}",
+                          kb([("🔁 Repeat at an interval", "a:sch_i")],
+                             [("⌨️ Type custom times", "a:sch_t")],
+                             [("⬅️ Menu", "a:menu")]))
+    if act == "sch_t":
+        set_state(uid, "sch_t", text=True)
+        return await show(q, SCHEDULE_HELP, CANCEL)
+    if act == "sch_i":
+        rows = [GAPS[i:i + 3] for i in range(0, len(GAPS), 3)]
+        return await show(q, "🔁 How often should a post go out?",
+                          kb(*[[(label, f"a:sch_g:{v}") for label, v in r] for r in rows],
+                             [("⬅️ Back", "a:sch")]))
+    if act == "sch_g":
+        gap = parts[1]
+        rows = [COUNTS[i:i + 3] for i in range(0, len(COUNTS), 3)]
+        return await show(q, f"🔢 Every {GAP_LABEL.get(gap, gap)}. How many posts in total?",
+                          kb(*[[(str(n), f"a:sch_c:{gap}:{n}") for n in r] for r in rows],
+                             [("⬅️ Back", "a:sch_i")]))
+    if act == "sch_c":
+        gap, n = parts[1], parts[2]
+        return await show(q, f"⏰ {n} posts, every {GAP_LABEL.get(gap, gap)}. When should the first one go out?",
+                          kb([("In 5 minutes", f"a:sch_s:{gap}:{n}:5m"),
+                              ("Next full hour", f"a:sch_s:{gap}:{n}:hr")],
+                             [("⌨️ Type start time", f"a:sch_x:{gap}:{n}")],
+                             [("⬅️ Back", f"a:sch_g:{gap}")]))
+    if act == "sch_s":
+        gap, n, when = parts[1], parts[2], parts[3]
+        return await schedule_from_args(q, [n, start_time(when), gap])
+    if act == "sch_x":
+        set_state(uid, "sch_x", text=True, gap=parts[1], n=parts[2])
+        return await show(q, f"⌨️ Send the start time as HH:MM (24-hour), for example 18:30.\nTimezone: {TZ}", CANCEL)
+
+    if act == "clr":
+        if not await feature_ready(q):
+            return
+        n = len(sched["queue"])
+        if not n:
+            return await show(q, "📭 No scheduled posts to cancel.", BACK)
+        return await show(q, f"❌ Cancel all {plural(n, 'scheduled post')}?",
+                          kb([("✅ Yes, cancel them", "a:clrok"), ("✖️ No", "a:menu")]))
+    if act == "clrok":
+        if not await feature_ready(q):
+            return
+        async with sched_lock:
+            n = len(sched["queue"])
+            sched["queue"] = []
+            await persist("sched")
+        return await show(q, f"🗑 {plural(n, 'scheduled post')} cancelled.", BACK)
+
+    await show(q, MENU_TEXT, menu_markup())
+
+
+# ---------- typed answers (only when a button asked for them) ----------
+@app.on_message(filters.private & filters.text & is_admin & awaiting_input)
+async def typed_input(c, m):
+    uid = m.from_user.id
+    st = pending[uid]
+    text = m.text.strip()
+    if text.startswith("/"):  # old habit: slash text just opens the panel
+        pending.pop(uid, None)
+        return await show(m, MENU_TEXT, menu_markup())
+    act = st["a"]
+
+    if act == "del":
+        code = text.lower().lstrip("#")
+        if not re.fullmatch(r"[a-z0-9_-]{1,60}", code) or code.startswith("__"):
+            return await show(m, "❌ Invalid code. Send the code again.", CANCEL)
+        try:
+            items = await get_items(code, fresh=True)
+        except Exception as e:
+            return await show(m, f"⚠️ Service error: {e}", BACK)
+        if not items:
+            return await show(m, "❌ Code not found. Send another code.", CANCEL)
+        set_state(uid, "delok", code=code)
+        return await show(m, f"🗑 Delete #{code} ({plural(len(items))}) from the index?",
+                          kb([("✅ Yes, delete", "a:delok"), ("✖️ Cancel", "a:menu")]))
+
+    if act == "scanrng":
+        try:
+            args = [int(x) for x in text.split()[:2]]
+        except ValueError:
+            args = []
+        if not args:
+            return await show(m, "❌ Send numbers only, for example: 1 5000", CANCEL)
+        pending.pop(uid, None)
+        return await run_scan(c, m, args)
+
+    if act == "sch_t":
+        return await schedule_from_args(m, text.split())
+
+    if act == "sch_x":
+        return await schedule_from_args(m, [st["n"], text, st["gap"]])
+
+
+@app.on_message(filters.private & filters.text & is_admin)
+async def admin_fallback(c, m):
+    await show(m, MENU_TEXT, menu_markup())
 
 
 async def main():
@@ -951,6 +1195,10 @@ async def main():
     http = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=100, ttl_dns_cache=300),
                                  timeout=aiohttp.ClientTimeout(total=15))
     await app.start()
+    try:  # remove the old slash-command menu
+        await app.delete_bot_commands()
+    except Exception:
+        pass
     web_app = web.Application()
     web_app.add_routes([web.get("/", lambda r: web.Response(text="ok"))])
     runner = web.AppRunner(web_app, access_log=None)  # no per-request log spam from health checks
