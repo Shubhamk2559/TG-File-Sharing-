@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import asyncio, html, io, json, logging, os, re, secrets, string
 import aiohttp
 from aiohttp import web
@@ -22,6 +23,8 @@ FORCE_SUB_LINK = os.environ.get("FORCE_SUB_LINK", "")
 AUTO_DELETE = int(os.environ.get("AUTO_DELETE", "0"))
 PROTECT = os.environ.get("PROTECT_CONTENT", "0") == "1"
 PORT = int(os.environ.get("PORT", "8000"))
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")   # optional: for exact Cloudflare numbers in /stats
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")     # optional: token with "Account Analytics: Read"
 
 app = Client("filebot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
              in_memory=True, workers=16)
@@ -62,6 +65,16 @@ async def list_codes():
 
 
 # ---------- helpers ----------
+stat = {"day": "", "dl": 0, "files": 0, "up": 0}
+
+
+def bump(key, n=1):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if stat["day"] != today:
+        stat.update(day=today, dl=0, files=0, up=0)
+    stat[key] += n
+
+
 async def retry(fn, *a, **k):
     while True:
         try:
@@ -174,6 +187,8 @@ async def start(c, m):
     await wait.delete()
     if not sent:
         return await m.reply("❌ Files unavailable. Admin needs to run /restore.")
+    bump("dl")
+    bump("files", len(sent))
     if AUTO_DELETE:
         note = await m.reply(f"⚠️ Files auto-delete in {AUTO_DELETE // 60 or 1} min. Save them now.")
         asyncio.create_task(delete_later(sent + [note]))
@@ -237,6 +252,7 @@ async def upload(c, m):
     if not res:
         return await m.reply("❌ Save failed.", quote=True)
     code, n = res
+    bump("up")
     await m.reply(f"✅ #{code} ({n} file{'s' if n > 1 else ''})\n🔗 {WORKER_URL}/{code}",
                   quote=True, disable_web_page_preview=True)
 
@@ -298,6 +314,53 @@ async def restore_cmd(c, m):
                 it["l"] = [x for x in it["l"] if x[0] in CHANNELS] or it["l"]
             await put_items(code, items)
     await status.edit(f"✅ Restored {ok}, failed {bad}")
+
+
+GQL = """query($acc:String!,$s:Time!,$e:Time!,$d:Date!){viewer{accounts(filter:{accountTag:$acc}){
+ w:workersInvocationsAdaptive(limit:100,filter:{datetime_geq:$s,datetime_leq:$e}){sum{requests errors}}
+ k:kvOperationsAdaptiveGroups(limit:100,filter:{date_geq:$d,date_leq:$d}){sum{requests} dimensions{actionType}}
+}}}"""
+
+
+def fmt_cf(acc):
+    wreq = sum(x["sum"]["requests"] for x in acc.get("w", []))
+    kv = {}
+    for x in acc.get("k", []):
+        a = x["dimensions"]["actionType"]
+        kv[a] = kv.get(a, 0) + x["sum"]["requests"]
+    return (f"☁️ Cloudflare (aaj, UTC)\n"
+            f"🌐 Worker requests: {wreq:,} / 100,000\n"
+            f"📖 KV reads: {kv.get('read', 0):,} / 100,000\n"
+            f"✍️ KV writes: {kv.get('write', 0):,} / 1,000\n"
+            f"🗑 KV deletes: {kv.get('delete', 0):,} / 1,000\n"
+            f"📋 KV lists: {kv.get('list', 0):,} / 1,000")
+
+
+@app.on_message(filters.command("stats") & filters.private & is_admin)
+async def stats_cmd(c, m):
+    bump("dl", 0)  # rolls the day over if needed
+    text = (f"📊 Stats ({stat['day']} UTC)\n\n"
+            f"🤖 Bot (restart ke baad se)\n"
+            f"⬇️ Downloads: {stat['dl']} ({stat['files']} files)\n"
+            f"⬆️ Uploads: {stat['up']}\n\n")
+    if CF_ACCOUNT_ID and CF_API_TOKEN:
+        now = datetime.now(timezone.utc)
+        v = {"acc": CF_ACCOUNT_ID, "d": now.strftime("%Y-%m-%d"),
+             "s": now.strftime("%Y-%m-%dT00:00:00Z"), "e": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        try:
+            async with http.post("https://api.cloudflare.com/client/v4/graphql",
+                                 headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
+                                 json={"query": GQL, "variables": v}) as r:
+                data = await r.json()
+            if data.get("errors"):
+                text += "⚠️ Cloudflare: " + str(data["errors"][0].get("message"))[:200]
+            else:
+                text += fmt_cf(data["data"]["viewer"]["accounts"][0])
+        except Exception as e:
+            text += f"⚠️ Cloudflare stats error: {e}"
+    else:
+        text += "☁️ Exact Cloudflare numbers ke liye CF_ACCOUNT_ID aur CF_API_TOKEN set karo."
+    await m.reply(text)
 
 
 async def main():
