@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from functools import lru_cache
-import asyncio, copy, html, io, json, logging, os, re, secrets, time
+import asyncio, copy, hashlib, hmac, html, io, json, logging, os, re, secrets, time
 
 try:  # faster event loop (optional) - must be installed BEFORE pyrogram is imported
     import uvloop
@@ -10,6 +10,7 @@ try:  # faster event loop (optional) - must be installed BEFORE pyrogram is impo
 except Exception:
     pass
 
+from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -18,7 +19,7 @@ from pyrogram import Client, filters, idle
 from pyrogram import errors as tg_errors
 from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.errors import FloodWait, MessageNotModified, UserNotParticipant
-from pyrogram.types import CallbackQuery, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup
+from pyrogram.types import CallbackQuery, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Markup, WebAppInfo
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)  # less log I/O under load
@@ -45,6 +46,17 @@ WORKERS = int(os.environ.get("WORKERS", "100"))        # concurrent update handl
 SEND_RATE = float(os.environ.get("SEND_RATE", "25"))   # max Telegram sends/sec (limit is ~30) -> no FloodWait storms
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))    # seconds a code stays cached (saves Cloudflare KV reads)
 CACHE_MAX = int(os.environ.get("CACHE_MAX", "5000"))   # max codes kept in RAM
+
+# ---- daily limit + ads (Monetag Rewarded Interstitial in a Telegram Mini App) ----
+DAILY_LIMIT = int(os.environ.get("DAILY_LIMIT", "20"))            # videos per user per day (0 = unlimited)
+QUOTA_SAVE_EVERY = int(os.environ.get("QUOTA_SAVE_EVERY", "600"))  # seconds between KV saves of the counters
+AD_ZONE = os.environ.get("AD_ZONE", "").strip()                    # Monetag zone id
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "").rstrip("/")          # public https URL of this bot's web server
+AD_MIN_WATCH = int(os.environ.get("AD_MIN_WATCH", "5"))            # min seconds between ad start and finish
+AD_TOKEN_TTL = 600                                                 # seconds a "Watch ad" button stays valid
+ADMINS_SKIP_ADS = os.environ.get("ADMINS_SKIP_ADS", "0") == "1"
+AD_READY = bool(re.sub(r"\D", "", AD_ZONE) and WEBAPP_URL.startswith("https://"))
+ads = {"on": AD_READY and os.environ.get("AD_GATE", "1") == "1"}   # can be toggled from the admin panel
 
 app = Client("filebot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
              in_memory=True, workers=WORKERS)
@@ -195,13 +207,13 @@ async def list_codes():
 
 
 # ---------- helpers ----------
-stat = {"day": "", "dl": 0, "files": 0, "up": 0}
+stat = {"day": "", "dl": 0, "files": 0, "up": 0, "ads": 0, "blocked": 0}
 
 
 def bump(key, n=1):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if stat["day"] != today:
-        stat.update(day=today, dl=0, files=0, up=0)
+        stat.update(day=today, dl=0, files=0, up=0, ads=0, blocked=0)
     stat[key] += n
 
 
@@ -317,7 +329,7 @@ async def start(c, m):
     if len(m.command) < 2:
         if m.from_user.id in ADMINS:  # admins get the button panel
             pending.pop(m.from_user.id, None)
-            return await m.reply(MENU_TEXT, reply_markup=menu_markup())
+            return await m.reply(menu_text(), reply_markup=menu_markup())
         return await m.reply("👋 Send me a file link to get your files.")
     code = m.command[1].lower()
     if not re.fullmatch(r"[a-z0-9_-]{1,60}", code):
@@ -325,26 +337,159 @@ async def start(c, m):
     uid = m.from_user.id
     if uid in busy:  # same user spamming the link -> don't multiply the work
         return await m.reply("⏳ Your files are already being sent. Please wait.")
+    if not await joined(c, uid):
+        retry_url = f"https://t.me/{c.me.username}?start={code}"
+        join = FORCE_SUB_LINK or f"https://t.me/{FORCE_SUB.lstrip('@')}"
+        return await m.reply("🔒 Join the channel first, then tap Try again.",
+                             reply_markup=Markup([[Btn("Join channel", url=join)],
+                                                  [Btn("Try again", url=retry_url)]]))
+    try:
+        items = await get_items(code)
+    except Exception as e:
+        logging.error("worker error: %s", e)
+        return await m.reply("⚠️ Service error, try again later.")
+    if not items:
+        return await m.reply("❌ File not found.")
+    left = quota_left(uid)
+    if left <= 0:  # checked BEFORE the ad, so nobody watches an ad for nothing
+        stat["blocked"] += 1
+        return await m.reply(f"⛔ Daily limit reached ({DAILY_LIMIT} videos per day). " + reset_text())
+    if ads["on"] and not (ADMINS_SKIP_ADS and uid in ADMINS):
+        text = "🔒 Watch a short ad to unlock your files."
+        if len(items) > left:
+            text += f"\n\nYou have {left} video(s) left today, so you will receive the first {left}."
+        url = f"{WEBAPP_URL}/ad?t={make_token(uid, code)}"
+        return await m.reply(text, reply_markup=Markup([[Btn("▶️ Watch ad & unlock", web_app=WebAppInfo(url=url))]]))
+    await deliver(c, uid, code, items)
+
+
+# ======================================================================
+#  DAILY LIMIT  +  AD GATE (Monetag Rewarded Interstitial inside a Telegram Mini App)
+# ======================================================================
+QUOTA_KEY, ADS_CFG_KEY = "__limits", "__cfg_ads"   # "__" keys are hidden from /export & restore
+quota = {"day": "", "u": {}}   # uid -> videos received today (resets at midnight in TIMEZONE)
+quota_dirty = False
+ad_sessions = TTLCache(50000)  # nonce -> monotonic start time of the ad
+ad_used = TTLCache(50000)      # nonce -> True (a token unlocks exactly once)
+AD_KEY = hashlib.sha256(f"{API_SECRET}:{BOT_TOKEN}".encode()).digest()
+
+
+def _roll():
+    day = datetime.now(TZ).strftime("%Y-%m-%d")
+    if quota["day"] != day:
+        quota["day"], quota["u"] = day, {}
+
+
+def quota_left(uid):
+    if not DAILY_LIMIT or uid in ADMINS:
+        return 10 ** 9
+    _roll()
+    return max(DAILY_LIMIT - quota["u"].get(uid, 0), 0)
+
+
+def quota_use(uid, n):
+    global quota_dirty
+    if not DAILY_LIMIT or uid in ADMINS or n <= 0:
+        return
+    _roll()
+    quota["u"][uid] = quota["u"].get(uid, 0) + n
+    quota_dirty = True
+
+
+def quota_doc():
+    return {"day": quota["day"], "u": {str(k): v for k, v in quota["u"].items()}}
+
+
+async def quota_saver():
+    """One KV write every QUOTA_SAVE_EVERY seconds (only if something changed) - keeps KV writes low."""
+    global quota_dirty
+    while True:
+        await asyncio.sleep(QUOTA_SAVE_EVERY)
+        if quota_dirty:
+            quota_dirty = False
+            try:
+                await kv_put(QUOTA_KEY, quota_doc())
+            except Exception as e:
+                quota_dirty = True
+                logging.error("saving daily limits failed (will retry): %s", e)
+
+
+async def load_quota():
+    try:
+        d = await kv_get(QUOTA_KEY)
+        _roll()
+        if isinstance(d, dict) and d.get("day") == quota["day"]:
+            quota["u"] = {int(k): int(v) for k, v in d.get("u", {}).items()}
+    except Exception as e:
+        logging.error("could not load daily limits: %s", e)
+
+
+def reset_text():
+    return f"Your limit resets at midnight ({TZ})."
+
+
+# ---------- signed one-time tokens (stateless: no storage needed) ----------
+def make_token(uid, code):
+    payload = f"{uid}.{code}.{int(time.time()) + AD_TOKEN_TTL}.{secrets.token_hex(6)}"
+    return payload + "." + hmac.new(AD_KEY, payload.encode(), hashlib.sha256).hexdigest()[:24]
+
+
+def read_token(tok):
+    """-> (uid, code, nonce) or None"""
+    try:
+        payload, sig = tok.rsplit(".", 1)
+        good = hmac.new(AD_KEY, payload.encode(), hashlib.sha256).hexdigest()[:24]
+        if not hmac.compare_digest(sig, good):
+            return None
+        uid, code, exp, nonce = payload.split(".")
+        if int(exp) < time.time():
+            return None
+        return int(uid), code, nonce
+    except Exception:
+        return None
+
+
+def verify_init(init_data):
+    """Telegram Mini App initData check -> user id, or None."""
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        got = pairs.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(hmac.new(key, check.encode(), hashlib.sha256).hexdigest(), got):
+            return None
+        if time.time() - int(pairs.get("auth_date", "0")) > 3600:
+            return None
+        return int(json.loads(pairs["user"])["id"])
+    except Exception:
+        return None
+
+
+# ---------- delivery (used by the ad gate and by direct links) ----------
+async def deliver(c, uid, code, items=None):
+    if uid in busy:  # same user spamming -> don't multiply the work
+        return
     busy.add(uid)
     try:
-        if not await joined(c, uid):
-            retry_url = f"https://t.me/{c.me.username}?start={code}"
-            join = FORCE_SUB_LINK or f"https://t.me/{FORCE_SUB.lstrip('@')}"
-            return await m.reply("🔒 Join the channel first, then tap Try again.",
-                                 reply_markup=Markup([[Btn("Join channel", url=join)],
-                                                      [Btn("Try again", url=retry_url)]]))
         try:
-            items = await get_items(code)
+            items = items if items is not None else await get_items(code)
         except Exception as e:
             logging.error("worker error: %s", e)
-            return await m.reply("⚠️ Service error, try again later.")
+            return await retry(c.send_message, uid, "⚠️ Service error, try again later.")
         if not items:
-            return await m.reply("❌ File not found.")
-        wait = await retry(m.reply, "⏳ Sending…")
+            return await retry(c.send_message, uid, "❌ File not found.")
+        left = quota_left(uid)
+        if left <= 0:
+            stat["blocked"] += 1
+            return await retry(c.send_message, uid, f"⛔ Daily limit reached ({DAILY_LIMIT} videos per day). "
+                                                    + reset_text())
+        trimmed = len(items) > left
+        items = items[:left]
+        wait = await retry(c.send_message, uid, "⏳ Sending…")
         sent = []
         for it in items:
             try:
-                sent.append(await send_item(c, m.chat.id, it, code))
+                sent.append(await send_item(c, uid, it, code))
             except USER_ERRORS:
                 break  # user blocked the bot / account gone
             except Exception as e:
@@ -354,16 +499,127 @@ async def start(c, m):
         except Exception:
             pass
         if not sent:
-            return await m.reply("❌ Files unavailable. Please contact the admin.")
+            return await retry(c.send_message, uid, "❌ Files unavailable. Please contact the admin.")
+        quota_use(uid, len(sent))
         bump("dl")
         bump("files", len(sent))
+        notes = []
+        if trimmed:
+            notes.append(f"ℹ️ Daily limit reached ({DAILY_LIMIT} videos per day), so only the first "
+                         f"{len(sent)} file(s) were sent. " + reset_text())
+        elif DAILY_LIMIT and uid not in ADMINS and quota_left(uid) <= 5:
+            notes.append(f"📊 {quota_left(uid)} of {DAILY_LIMIT} videos left today.")
         if AUTO_DELETE:
-            note = await retry(m.reply, f"⚠️ Files auto-delete in {AUTO_DELETE // 60 or 1} min. Save them now.")
-            t = asyncio.create_task(delete_later(c, m.chat.id, [x.id for x in sent] + [note.id]))
+            notes.append(f"⚠️ Files auto-delete in {AUTO_DELETE // 60 or 1} min. Save them now.")
+        ids = [x.id for x in sent]
+        if notes:
+            note = await retry(c.send_message, uid, "\n\n".join(notes))
+            ids.append(note.id)
+        if AUTO_DELETE:
+            t = asyncio.create_task(delete_later(c, uid, ids))
             bg_tasks.add(t)
             t.add_done_callback(bg_tasks.discard)
     finally:
         busy.discard(uid)
+
+
+# ---------- Mini App page + API (served by the bot's own web server) ----------
+AD_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Unlock files</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://libtl.com/sdk.js" data-zone="__ZONE__" data-sdk="show___ZONE__"></script>
+<style>
+:root{--bg:#ffffff;--fg:#111111;--hint:#6b7280;--btn:#2481cc;--btnfg:#ffffff}
+@media (prefers-color-scheme:dark){:root{--bg:#17212b;--fg:#f5f5f5;--hint:#9aa5b1;--btn:#2b8be0;--btnfg:#ffffff}}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;text-align:center}
+.card{max-width:360px;width:100%}
+#icon{font-size:56px;margin-bottom:8px}
+h1{font-size:22px;margin:0 0 8px}
+p{color:var(--hint);font-size:15px;line-height:1.45;margin:0 0 20px}
+button{background:var(--btn);color:var(--btnfg);border:0;border-radius:12px;padding:14px 22px;font-size:16px;width:100%}
+button:disabled{opacity:.6}
+</style></head><body>
+<div class="card"><div id="icon">🔒</div><h1 id="title">Unlock your files</h1>
+<p id="msg">Watch a short ad and your files will be sent to the chat.</p>
+<button id="btn">▶️ Watch ad</button></div>
+<script>
+const tg=window.Telegram.WebApp;tg.ready();tg.expand();
+const ZONE="__ZONE__",T=new URLSearchParams(location.search).get("t")||"";
+const $=id=>document.getElementById(id);
+function say(i,t,m,btn){$("icon").textContent=i;$("title").textContent=t;$("msg").textContent=m;
+$("btn").style.display=btn?"block":"none";if(btn)$("btn").textContent="🔄 Try again";}
+async function post(path){
+ try{const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},
+ body:JSON.stringify({t:T,initData:tg.initData})});return await r.json();}catch(e){return{ok:false,error:"Network error. Please try again.",retry:true};}}
+let running=false;
+async function run(){
+ if(running)return;running=true;$("btn").disabled=true;
+ try{
+  const s=await post("/api/ad/start");
+  if(!s.ok){say("⚠️","Cannot start",s.error||"Please open the file link in the bot again.",!!s.retry);return;}
+  const show=window["show_"+ZONE];
+  if(typeof show!=="function")throw new Error("sdk");
+  await show({ymid:String(s.ymid||"")});
+  const d=await post("/api/ad/done");
+  if(d.ok){say("✅","Unlocked!","Your files are being sent to the chat.",false);setTimeout(()=>tg.close(),1500);}
+  else{say("⚠️","Could not unlock",d.error||"Please try again.",!!d.retry);}
+ }catch(e){
+  say("⚠️","Ad not completed","Watch the full ad. If it does not load, turn off your ad blocker or private DNS, then tap Try again.",true);
+ }finally{running=false;$("btn").disabled=false;}
+}
+$("btn").onclick=run;window.addEventListener("load",()=>setTimeout(run,300));
+</script></body></html>"""
+
+
+async def ad_page(request):
+    html_text = AD_HTML.replace("__ZONE__", re.sub(r"\D", "", AD_ZONE))
+    return web.Response(text=html_text, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+async def _ad_check(request):
+    """-> (uid, code, nonce, None) or (None, None, None, error_json)"""
+    try:
+        d = await request.json()
+    except Exception:
+        d = {}
+    uid = verify_init(str(d.get("initData", "")))
+    tok = read_token(str(d.get("t", "")))
+    if not uid or not tok or tok[0] != uid:
+        return None, None, None, {"ok": False, "error": "This link has expired. Please open the file link in the bot again."}
+    return uid, tok[1], tok[2], None
+
+
+async def ad_start(request):
+    uid, code, nonce, err = await _ad_check(request)
+    if err:
+        return web.json_response(err)
+    if ad_used.get(nonce):
+        return web.json_response({"ok": False, "error": "This unlock was already used. Open the file link again."})
+    if quota_left(uid) <= 0:
+        return web.json_response({"ok": False, "error": f"Daily limit reached ({DAILY_LIMIT} videos). " + reset_text()})
+    ad_sessions.set(nonce, time.monotonic(), AD_TOKEN_TTL)
+    return web.json_response({"ok": True, "ymid": nonce})
+
+
+async def ad_done(request):
+    uid, code, nonce, err = await _ad_check(request)
+    if err:
+        return web.json_response(err)
+    t0 = ad_sessions.get(nonce)
+    if t0 is None or ad_used.get(nonce):
+        return web.json_response({"ok": False, "error": "Session expired. Please try again.", "retry": True})
+    if time.monotonic() - t0 < AD_MIN_WATCH:
+        return web.json_response({"ok": False, "error": "Please watch the full ad.", "retry": True})
+    ad_sessions.pop(nonce)
+    ad_used.set(nonce, True, AD_TOKEN_TTL + 120)
+    bump("ads")
+    t = asyncio.create_task(deliver(app, uid, code))
+    bg_tasks.add(t)
+    t.add_done_callback(bg_tasks.discard)
+    return web.json_response({"ok": True})
 
 
 # ---------- admin side ----------
@@ -767,9 +1023,12 @@ def kb(*rows):
 
 BACK = kb([("⬅️ Menu", "a:menu")])
 CANCEL = kb([("✖️ Cancel", "a:menu")])
-MENU_TEXT = ("🛠 <b>Admin Panel</b>\n\n"
-             "Send any file to this chat to get a share link.\n"
-             "Use the buttons below for everything else.")
+def menu_text():
+    lines = ["🛠 <b>Admin Panel</b>", ""]
+    lines.append(f"📢 Ads: {'ON' if ads['on'] else 'OFF'}" + ("" if AD_READY else " (set AD_ZONE and an https WEBAPP_URL)"))
+    lines.append(f"⏱ Daily limit: {DAILY_LIMIT} videos per user" if DAILY_LIMIT else "⏱ Daily limit: off")
+    lines += ["", "Send any file to this chat to get a share link.", "Use the buttons below for everything else."]
+    return "\n".join(lines)
 GAPS = [("30 min", "30m"), ("1 hour", "1h"), ("2 hours", "2h"),
         ("3 hours", "3h"), ("6 hours", "6h"), ("12 hours", "12h")]
 GAP_LABEL = {v: k for k, v in GAPS}
@@ -778,7 +1037,8 @@ COUNTS = [5, 10, 20, 30, 50, 100]
 
 def menu_markup():
     rows = [[("📊 Stats", "a:stats"), ("📤 Export", "a:export")],
-            [("🗑 Delete Code", "a:del"), ("♻️ Restore", "a:restore")]]
+            [("🗑 Delete Code", "a:del"), ("♻️ Restore", "a:restore")],
+            [(f"📢 Ads: {'ON ✅' if ads['on'] else 'OFF ⛔'}", "a:ads")]]
     if feature_on():
         rows += [[("🔍 Scan Source", "a:scan"), ("📋 Posts", "a:posts")],
                  [("📅 Schedule", "a:sch"), ("⚡ Post Now", "a:now")],
@@ -825,7 +1085,9 @@ async def build_stats():
     text = (f"📊 Stats ({stat['day']} UTC)\n\n"
             f"🤖 Bot (since last restart)\n"
             f"⬇️ Downloads: {stat['dl']} ({stat['files']} files)\n"
-            f"⬆️ Uploads: {stat['up']}\n\n")
+            f"⬆️ Uploads: {stat['up']}\n"
+            f"📢 Ads completed: {stat['ads']}\n"
+            f"⛔ Daily-limit blocks: {stat['blocked']}\n\n")
     if CF_ACCOUNT_ID and CF_API_TOKEN:
         now = datetime.now(timezone.utc)
         v = {"acc": CF_ACCOUNT_ID, "d": now.strftime("%Y-%m-%d"),
@@ -861,7 +1123,7 @@ async def do_export(c, x):
         f.name = "backup.json"
         chat_id = x.message.chat.id if isinstance(x, CallbackQuery) else x.chat.id
         await retry(c.send_document, chat_id, f, caption=f"{len(data)} codes")
-        await show(x, MENU_TEXT, menu_markup())
+        await show(x, menu_text(), menu_markup())
     except Exception as e:
         logging.error("export failed: %s", e)
         await show(x, f"❌ Export failed: {e}", BACK)
@@ -1033,10 +1295,20 @@ async def panel(c, q):
 
     if act in ("menu", "cancel"):
         pending.pop(uid, None)
-        return await show(q, MENU_TEXT, menu_markup())
+        return await show(q, menu_text(), menu_markup())
     if act == "menunew":
         pending.pop(uid, None)
-        return await retry(q.message.reply, MENU_TEXT, reply_markup=menu_markup())
+        return await retry(q.message.reply, menu_text(), reply_markup=menu_markup())
+
+    if act == "ads":
+        if not AD_READY:
+            return await show(q, "⚠️ Set the AD_ZONE and WEBAPP_URL (https) env variables first.", BACK)
+        ads["on"] = not ads["on"]
+        try:
+            await kv_put(ADS_CFG_KEY, {"on": ads["on"]})
+        except Exception as e:
+            logging.error("saving ads setting failed: %s", e)
+        return await show(q, menu_text(), menu_markup())
 
     if act == "stats":
         return await show(q, await build_stats(), kb([("🔄 Refresh", "a:stats"), ("⬅️ Menu", "a:menu")]))
@@ -1049,7 +1321,7 @@ async def panel(c, q):
     if act == "delok":
         st = pending.pop(uid, None)
         if not st or st["a"] != "delok":
-            return await show(q, MENU_TEXT, menu_markup())
+            return await show(q, menu_text(), menu_markup())
         try:
             await del_code(st["code"])
         except Exception as e:
@@ -1140,7 +1412,7 @@ async def panel(c, q):
             await persist("sched")
         return await show(q, f"🗑 {plural(n, 'scheduled post')} cancelled.", BACK)
 
-    await show(q, MENU_TEXT, menu_markup())
+    await show(q, menu_text(), menu_markup())
 
 
 # ---------- typed answers (only when a button asked for them) ----------
@@ -1151,7 +1423,7 @@ async def typed_input(c, m):
     text = m.text.strip()
     if text.startswith("/"):  # old habit: slash text just opens the panel
         pending.pop(uid, None)
-        return await show(m, MENU_TEXT, menu_markup())
+        return await show(m, menu_text(), menu_markup())
     act = st["a"]
 
     if act == "del":
@@ -1187,7 +1459,7 @@ async def typed_input(c, m):
 
 @app.on_message(filters.private & filters.text & is_admin)
 async def admin_fallback(c, m):
-    await show(m, MENU_TEXT, menu_markup())
+    await show(m, menu_text(), menu_markup())
 
 
 async def main():
@@ -1200,7 +1472,10 @@ async def main():
     except Exception:
         pass
     web_app = web.Application()
-    web_app.add_routes([web.get("/", lambda r: web.Response(text="ok"))])
+    web_app.add_routes([web.get("/", lambda r: web.Response(text="ok")),
+                        web.get("/ad", ad_page),
+                        web.post("/api/ad/start", ad_start),
+                        web.post("/api/ad/done", ad_done)])
     runner = web.AppRunner(web_app, access_log=None)  # no per-request log spam from health checks
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
@@ -1208,6 +1483,21 @@ async def main():
         await api("POST", "put", params={"code": "__cfg_bot"}, data=app.me.username)
     except Exception as e:
         logging.error("could not save bot username to worker: %s", e)
+    if AD_READY:
+        try:
+            cfg = await kv_get(ADS_CFG_KEY)
+            if isinstance(cfg, dict) and "on" in cfg:
+                ads["on"] = bool(cfg["on"])
+        except Exception as e:
+            logging.error("could not load ads setting: %s", e)
+    elif AD_ZONE or WEBAPP_URL:
+        logging.warning("Ads are OFF: set both AD_ZONE and an https WEBAPP_URL")
+    if DAILY_LIMIT:
+        await load_quota()
+        t = asyncio.create_task(quota_saver())
+        bg_tasks.add(t)
+        t.add_done_callback(bg_tasks.discard)
+    logging.info("Ads: %s | daily limit: %s", "ON" if ads["on"] else "OFF", DAILY_LIMIT or "off")
     if feature_on():
         t = asyncio.create_task(scheduler(app))
         bg_tasks.add(t)
@@ -1215,6 +1505,11 @@ async def main():
         logging.info("Post scheduler on: %s -> %s", SOURCE_CHANNEL, TARGET_CHANNEL)
     logging.info("Bot @%s running", app.me.username)
     await idle()
+    if quota_dirty:  # save the counters before shutting down
+        try:
+            await kv_put(QUOTA_KEY, quota_doc())
+        except Exception:
+            pass
     await app.stop()
     await http.close()
 
