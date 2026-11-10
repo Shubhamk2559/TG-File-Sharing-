@@ -353,7 +353,9 @@ async def start(c, m):
     left = quota_left(uid)
     if left <= 0:  # checked BEFORE the ad, so nobody watches an ad for nothing
         stat["blocked"] += 1
-        return await m.reply(f"⛔ Daily limit reached ({DAILY_LIMIT} videos per day). " + reset_text())
+        return await m.reply(f"⛔ Daily limit reached ({limit_for(uid)} videos per day). " + reset_text()
+                             + ("\n\n💎 Need more? Increase your limit instantly with UPI." if limit_markup(uid) else ""),
+                             reply_markup=limit_markup(uid))
     if ads["on"] and not (ADMINS_SKIP_ADS and uid in ADMINS):
         text = "🔒 Watch a short ad to unlock your files."
         if len(items) > left:
@@ -384,7 +386,7 @@ def quota_left(uid):
     if not DAILY_LIMIT or uid in ADMINS:
         return 10 ** 9
     _roll()
-    return max(DAILY_LIMIT - quota["u"].get(uid, 0), 0)
+    return max(limit_for(uid) - quota["u"].get(uid, 0), 0)
 
 
 def quota_use(uid, n):
@@ -481,8 +483,10 @@ async def deliver(c, uid, code, items=None):
         left = quota_left(uid)
         if left <= 0:
             stat["blocked"] += 1
-            return await retry(c.send_message, uid, f"⛔ Daily limit reached ({DAILY_LIMIT} videos per day). "
-                                                    + reset_text())
+            return await retry(c.send_message, uid, f"⛔ Daily limit reached ({limit_for(uid)} videos per day). "
+                                                    + reset_text()
+                               + ("\n\n💎 Need more? Increase your limit instantly with UPI." if limit_markup(uid) else ""),
+                               reply_markup=limit_markup(uid))
         trimmed = len(items) > left
         items = items[:left]
         wait = await retry(c.send_message, uid, "⏳ Sending…")
@@ -505,10 +509,11 @@ async def deliver(c, uid, code, items=None):
         bump("files", len(sent))
         notes = []
         if trimmed:
-            notes.append(f"ℹ️ Daily limit reached ({DAILY_LIMIT} videos per day), so only the first "
+            notes.append(f"ℹ️ Daily limit reached ({limit_for(uid)} videos per day), so only the first "
                          f"{len(sent)} file(s) were sent. " + reset_text())
         elif DAILY_LIMIT and uid not in ADMINS and quota_left(uid) <= 5:
-            notes.append(f"📊 {quota_left(uid)} of {DAILY_LIMIT} videos left today.")
+            notes.append(f"📊 {quota_left(uid)} of {limit_for(uid)} videos left today."
+                         + (" Send /premium to get more." if PAY_READY else ""))
         if AUTO_DELETE:
             notes.append(f"⚠️ Files auto-delete in {AUTO_DELETE // 60 or 1} min. Save them now.")
         ids = [x.id for x in sent]
@@ -599,7 +604,7 @@ async def ad_start(request):
     if ad_used.get(nonce):
         return web.json_response({"ok": False, "error": "This unlock was already used. Open the file link again."})
     if quota_left(uid) <= 0:
-        return web.json_response({"ok": False, "error": f"Daily limit reached ({DAILY_LIMIT} videos). " + reset_text()})
+        return web.json_response({"ok": False, "error": f"Daily limit reached ({limit_for(uid)} videos). " + reset_text()})
     ad_sessions.set(nonce, time.monotonic(), AD_TOKEN_TTL)
     return web.json_response({"ok": True, "ymid": nonce})
 
@@ -620,6 +625,323 @@ async def ad_done(request):
     bg_tasks.add(t)
     t.add_done_callback(bg_tasks.discard)
     return web.json_response({"ok": True})
+
+
+# ======================================================================
+#  PAID LIMIT UPGRADE - UPI via FamGateway (https://famgateway.in), verified automatically
+#  Flow: /premium -> pick plan -> QR + pay page -> payment is verified by webhook AND polling
+#        (no screenshot / UTR typing) -> user's daily limit goes up for N days.
+# ======================================================================
+FAM_API_KEY = os.environ.get("FAMGATEWAY_API_KEY", "").strip()
+FAM_BASE = os.environ.get("FAMGATEWAY_URL", "https://famgateway.in").rstrip("/")
+PREMIUM_KEY = "__premium"   # "__" key: hidden from /export & restore
+
+
+def _parse_plans(raw):
+    """'29:50:1 99:100:7' -> [(price_inr, videos_per_day, days), ...]"""
+    plans = []
+    for part in raw.replace(",", " ").split():
+        try:
+            price, lim, days = part.split(":")
+            p = (round(float(price), 2), int(lim), int(days))
+            if p[0] >= 1 and p[1] > 0 and p[2] > 0:
+                plans.append(p)
+        except ValueError:
+            logging.warning("bad PLANS entry ignored: %s", part)
+    return plans
+
+
+PLANS = _parse_plans(os.environ.get("PLANS", "29:50:1 99:100:7 299:200:30"))
+PAY_READY = bool(FAM_API_KEY and PLANS and DAILY_LIMIT)
+premium = {"u": {}, "done": []}   # u: uid -> [videos_per_day, expiry_epoch] | done: credited order ids
+orders = {}                       # order_id -> {uid, idx, price, chat, mid, ts}  (pending payments)
+fulfilling = set()
+order_cooldown = TTLCache(50000)
+
+
+def spawn(coro):
+    t = asyncio.create_task(coro)
+    bg_tasks.add(t)
+    t.add_done_callback(bg_tasks.discard)
+
+
+def limit_for(uid):
+    """Videos per day for this user (premium plan if active, else DAILY_LIMIT)."""
+    e = premium["u"].get(uid)
+    if e and e[1] > time.time():
+        return max(DAILY_LIMIT, e[0])
+    return DAILY_LIMIT
+
+
+def limit_markup(uid):
+    if PAY_READY and uid not in ADMINS:
+        return Markup([[Btn("💎 Increase limit", callback_data="p:menu")]])
+
+
+def fmt_dt(ts):
+    return datetime.fromtimestamp(ts, TZ).strftime("%d %b %Y %H:%M")
+
+
+async def load_premium():
+    try:
+        d = await kv_get(PREMIUM_KEY)
+        if isinstance(d, dict):
+            now = time.time()
+            premium["u"] = {int(k): [int(v[0]), int(v[1])] for k, v in d.get("u", {}).items() if v[1] > now}
+            premium["done"] = [str(x) for x in d.get("done", [])][-500:]
+    except Exception as e:
+        logging.error("could not load premium data: %s", e)
+
+
+async def save_premium():
+    now = time.time()
+    premium["u"] = {k: v for k, v in premium["u"].items() if v[1] > now}
+    doc = {"u": {str(k): v for k, v in premium["u"].items()}, "done": premium["done"][-500:]}
+    for i in range(4):
+        try:
+            return await kv_put(PREMIUM_KEY, doc) or True
+        except Exception as e:
+            logging.error("saving premium data failed (%s): %s", i + 1, e)
+            await asyncio.sleep(2 * (i + 1))
+    return False
+
+
+async def fam(method, path, **kw):
+    async with http.request(method, f"{FAM_BASE}/{path}", headers={"X-Api-Key": FAM_API_KEY}, **kw) as r:
+        try:
+            data = await r.json(content_type=None)
+        except Exception:
+            data = {}
+        return r.status, data if isinstance(data, dict) else {}
+
+
+def _data(d):
+    return d["data"] if isinstance(d.get("data"), dict) else d
+
+
+async def fam_create(uid, price):
+    body = {"amount": price, "customer_name": str(uid)}
+    if WEBAPP_URL.startswith("https://"):
+        body["webhook_url"] = f"{WEBAPP_URL}/api/fam/webhook"
+    st, d = await fam("POST", "api/create-order", json=body)
+    data = _data(d)
+    if st != 200 or d.get("status") != "success" or not data.get("order_id"):
+        raise RuntimeError(f"gateway {st}: {str(d)[:150]}")
+    return data
+
+
+async def fam_status(order_id):
+    """Public polling endpoint -> 'pending' | 'success' | 'expired' | 'error'"""
+    try:
+        async with http.get(f"{FAM_BASE}/api/checkout-status.php", params={"order_id": order_id}) as r:
+            return str((await r.json(content_type=None)).get("status", "error")).lower()
+    except Exception:
+        return "error"
+
+
+async def fam_verify(order_id, price):
+    """Server-to-server check with the API key (authoritative). -> data dict or None"""
+    st, d = await fam("GET", "api/verify-order.php", params={"order_id": order_id})
+    if st == 401:  # some deployments only read the key from the query string
+        st, d = await fam("GET", "api/verify-order.php", params={"order_id": order_id, "api_key": FAM_API_KEY})
+    data = _data(d)
+    if d.get("status") != "success" or str(data.get("order_id", order_id)) != order_id:
+        return None
+    raw = data.get("amount", data.get("payable_amount"))
+    if raw is not None:
+        try:
+            if abs(float(raw) - price) > 1:
+                logging.warning("amount mismatch for %s: paid %s, plan %s", order_id, raw, price)
+                return None
+        except ValueError:
+            return None
+    return data
+
+
+async def fulfill(c, order_id, webhook=None):
+    """Credit the plan exactly once. webhook = signed webhook body (already trusted) or None (-> verify via API)."""
+    o = orders.get(order_id)
+    if not o or order_id in premium["done"] or order_id in fulfilling:
+        return False
+    fulfilling.add(order_id)
+    try:
+        info = None
+        if webhook is not None:
+            try:
+                if abs(float(webhook.get("amount", 0)) - o["price"]) <= 1:
+                    info = webhook
+                else:
+                    logging.warning("webhook amount mismatch for %s: %s", order_id, webhook.get("amount"))
+            except (TypeError, ValueError):
+                pass
+        else:
+            info = await fam_verify(order_id, o["price"])
+        if not info:
+            return False
+        uid, (_, lim, days) = o["uid"], PLANS[o["idx"]]
+        now, old = time.time(), premium["u"].get(o["uid"])
+        active = old and old[1] > now
+        premium["u"][uid] = [max(lim, old[0]) if active else lim, int((old[1] if active else now) + days * 86400)]
+        premium["done"] = (premium["done"] + [order_id])[-500:]
+        orders.pop(order_id, None)
+        saved = await save_premium()
+        exp = premium["u"][uid][1]
+        utr = info.get("utr", "-")
+        text = (f"✅ <b>Payment received!</b> (UTR {html.escape(str(utr))})\n\n"
+                f"💎 Your limit: <b>{premium['u'][uid][0]} videos/day</b> until {fmt_dt(exp)}.\n"
+                f"📊 Left today: {quota_left(uid)}\n\nNow open your file link again.")
+        try:
+            if o.get("mid"):
+                await retry(c.delete_messages, o["chat"], o["mid"])
+        except Exception:
+            pass
+        try:
+            await retry(c.send_message, uid, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logging.warning("could not notify %s: %s", uid, e)
+        await notify_admins(c, f"💰 ₹{o['price']:g} received from user {uid} ({order_id}, UTR {utr}) -> "
+                               f"{premium['u'][uid][0]}/day till {fmt_dt(exp)}"
+                            + ("" if saved else "\n⚠️ Could not save to the worker! It is active in RAM only."))
+        return True
+    finally:
+        fulfilling.discard(order_id)
+
+
+async def watch_order(c, order_id, deadline):
+    """Polls the gateway until the order is paid or expired -> automatic verification."""
+    while time.time() < deadline and order_id in orders:
+        await asyncio.sleep(4)
+        st = await fam_status(order_id)
+        if st == "success":
+            if await fulfill(c, order_id) or order_id in premium["done"]:
+                return
+        elif st == "expired":
+            break
+    o = orders.pop(order_id, None) if order_id not in premium["done"] else None
+    if o:
+        try:
+            if o.get("mid"):
+                await retry(c.delete_messages, o["chat"], o["mid"])
+            await retry(c.send_message, o["chat"], "⌛ Payment window expired. If you paid, it will still be "
+                        "credited automatically; otherwise tap /premium to try again.")
+        except Exception:
+            pass
+
+
+def premium_text(uid):
+    lines = ["💎 <b>Increase your daily limit</b>", "",
+             f"Free limit: {DAILY_LIMIT} videos/day"]
+    e = premium["u"].get(uid)
+    if e and e[1] > time.time():
+        lines.append(f"✅ Your plan: {e[0]} videos/day until {fmt_dt(e[1])}")
+    lines += ["", "Pay with any UPI app (GPay, PhonePe, Paytm, BHIM...). Payment is verified "
+              "<b>automatically</b> in a few seconds.", "", "Choose a plan:"]
+    return "\n".join(lines)
+
+
+def plans_markup():
+    return Markup([[Btn(f"₹{p:g} • {lim} videos/day • {days} day{'s' if days > 1 else ''}",
+                        callback_data=f"p:buy:{i}")] for i, (p, lim, days) in enumerate(PLANS)])
+
+
+@app.on_message(filters.command(["premium", "buy", "plans"]) & filters.private)
+async def premium_cmd(c, m):
+    if not PAY_READY:
+        return await m.reply("⚠️ Payments are not available right now.")
+    await m.reply(premium_text(m.from_user.id), reply_markup=plans_markup(), parse_mode=ParseMode.HTML)
+
+
+@app.on_callback_query(filters.regex(r"^p:"))
+async def pay_cb(c, q):
+    uid, parts = q.from_user.id, q.data.split(":")
+    act = parts[1] if len(parts) > 1 else ""
+
+    async def say(text, alert=False):
+        try:
+            await q.answer(text, show_alert=alert)
+        except Exception:
+            pass
+
+    if not PAY_READY:
+        return await say("Payments are not available right now.", True)
+
+    if act == "menu":
+        await say("")
+        return await retry(q.message.reply, premium_text(uid), reply_markup=plans_markup(),
+                           parse_mode=ParseMode.HTML)
+
+    if act == "buy" and len(parts) == 3 and parts[2].isdigit() and int(parts[2]) < len(PLANS):
+        idx = int(parts[2])
+        if order_cooldown.get(uid):
+            return await say("⏳ Please wait a few seconds.")
+        order_cooldown.set(uid, True, 8)
+        price, lim, days = PLANS[idx]
+        await say("Creating payment…")
+        try:
+            d = await fam_create(uid, price)
+        except Exception as e:
+            logging.error("create order failed: %s", e)
+            return await retry(q.message.reply, "⚠️ Could not create the payment right now. Please try again in a minute.")
+        oid = d["order_id"]
+        pay = d.get("payable_amount") or d.get("amount") or f"{price:.2f}"
+        caption = (f"💎 <b>{lim} videos/day for {days} day{'s' if days > 1 else ''}</b>\n\n"
+                   f"💰 Pay exactly: <b>₹{html.escape(str(pay))}</b>\n"
+                   f"🏦 UPI ID: <code>{html.escape(str(d.get('upi_id', '')))}</code>\n\n"
+                   "1️⃣ Scan this QR with any UPI app (or tap “Open payment page”)\n"
+                   "2️⃣ Pay the <b>exact amount</b> shown\n"
+                   "3️⃣ Your limit is increased automatically ✅\n\n"
+                   f"⏱ Valid for 5 minutes" + (f" (till {html.escape(str(d['expires_at_ist']))} IST)" if d.get("expires_at_ist") else ""))
+        rows = [[Btn("🔄 I have paid - check", callback_data=f"p:chk:{oid}")]]
+        if d.get("checkout_url"):
+            rows.insert(0, [Btn("💳 Open payment page", url=d["checkout_url"])])
+        mk = Markup(rows)
+        orders[oid] = {"uid": uid, "idx": idx, "price": price, "chat": uid, "mid": None, "ts": time.time()}
+        sent = None
+        try:
+            if d.get("qr_url"):
+                sent = await retry(q.message.reply_photo, d["qr_url"], caption=caption,
+                                   parse_mode=ParseMode.HTML, reply_markup=mk)
+        except Exception as e:
+            logging.warning("QR photo failed: %s", e)
+        if sent is None:
+            sent = await retry(q.message.reply, caption, parse_mode=ParseMode.HTML, reply_markup=mk)
+        orders[oid]["mid"] = sent.id
+        spawn(watch_order(c, oid, time.time() + 330))
+        return
+
+    if act == "chk" and len(parts) == 3:
+        oid = parts[2]
+        o = orders.get(oid)
+        if oid in premium["done"]:
+            return await say("✅ Already credited. Your limit is increased.", True)
+        if not o or o["uid"] != uid:
+            return await say("This payment has expired. Tap /premium to start again.", True)
+        if await fam_status(oid) == "success" and await fulfill(c, oid):
+            return await say("✅ Payment received!")
+        return await say("Payment not received yet. If you just paid, wait 10-20 seconds; it is credited automatically.", True)
+
+    await say("")
+
+
+async def fam_webhook(request):
+    raw = await request.read()
+    sig = request.headers.get("X-FamGateway-Signature", "").strip().lower().encode()
+    good = hmac.new(FAM_API_KEY.encode(), raw, hashlib.sha256).hexdigest().encode()
+    if not FAM_API_KEY or not hmac.compare_digest(sig, good):
+        return web.Response(status=401, text="invalid signature")
+    try:
+        ev = json.loads(raw)
+    except Exception:
+        return web.Response(status=400, text="bad json")
+    oid = str(ev.get("order_id", ""))
+    if ev.get("event", "payment.success") == "payment.success" and str(ev.get("status", "success")) == "success" and oid:
+        if oid in orders:
+            spawn(fulfill(app, oid, webhook=ev))
+        elif oid not in premium["done"]:
+            logging.warning("webhook for unknown order %s (bot restarted mid-payment?)", oid)
+            spawn(notify_admins(app, f"⚠️ Payment webhook for unknown order {oid} (₹{ev.get('amount')}, "
+                                     f"UTR {ev.get('utr')}). Credit it manually if the user complains."))
+    return web.json_response({"status": "ok"})
 
 
 # ---------- admin side ----------
@@ -1027,6 +1349,7 @@ def menu_text():
     lines = ["🛠 <b>Admin Panel</b>", ""]
     lines.append(f"📢 Ads: {'ON' if ads['on'] else 'OFF'}" + ("" if AD_READY else " (set AD_ZONE and an https WEBAPP_URL)"))
     lines.append(f"⏱ Daily limit: {DAILY_LIMIT} videos per user" if DAILY_LIMIT else "⏱ Daily limit: off")
+    lines.append(f"💎 UPI payments: {'ON (' + str(len(PLANS)) + ' plans, ' + str(len(premium['u'])) + ' active)' if PAY_READY else 'OFF (set FAMGATEWAY_API_KEY)'}")
     lines += ["", "Send any file to this chat to get a share link.", "Use the buttons below for everything else."]
     return "\n".join(lines)
 GAPS = [("30 min", "30m"), ("1 hour", "1h"), ("2 hours", "2h"),
@@ -1475,7 +1798,8 @@ async def main():
     web_app.add_routes([web.get("/", lambda r: web.Response(text="ok")),
                         web.get("/ad", ad_page),
                         web.post("/api/ad/start", ad_start),
-                        web.post("/api/ad/done", ad_done)])
+                        web.post("/api/ad/done", ad_done),
+                        web.post("/api/fam/webhook", fam_webhook)])
     runner = web.AppRunner(web_app, access_log=None)  # no per-request log spam from health checks
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
@@ -1492,6 +1816,12 @@ async def main():
             logging.error("could not load ads setting: %s", e)
     elif AD_ZONE or WEBAPP_URL:
         logging.warning("Ads are OFF: set both AD_ZONE and an https WEBAPP_URL")
+    if PAY_READY:
+        await load_premium()
+        logging.info("UPI payments ON (FamGateway): %d plans, webhook %s", len(PLANS),
+                     f"{WEBAPP_URL}/api/fam/webhook" if WEBAPP_URL.startswith("https://") else "off (polling only)")
+    elif FAM_API_KEY:
+        logging.warning("Payments are OFF: need PLANS and DAILY_LIMIT > 0")
     if DAILY_LIMIT:
         await load_quota()
         t = asyncio.create_task(quota_saver())
