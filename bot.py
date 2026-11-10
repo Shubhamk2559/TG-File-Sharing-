@@ -13,6 +13,8 @@ API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DB_CHANNEL = int(os.environ["DB_CHANNEL"])
 ADMINS = {int(x) for x in os.environ.get("ADMINS", "").split() if x}
+BACKUP_CHANNEL = int(os.environ.get("BACKUP_CHANNEL", "0"))
+CHANNELS = [DB_CHANNEL] + ([BACKUP_CHANNEL] if BACKUP_CHANNEL else [])
 WORKER_URL = os.environ["WORKER_URL"].rstrip("/")
 API_SECRET = os.environ["API_SECRET"]
 FORCE_SUB = os.environ.get("FORCE_SUB", "")
@@ -56,7 +58,7 @@ async def del_code(code):
 
 
 async def list_codes():
-    return json.loads(await api("GET", "list"))
+    return [k for k in json.loads(await api("GET", "list")) if not k.startswith("__")]
 
 
 # ---------- helpers ----------
@@ -76,32 +78,38 @@ def media_of(m):
 
 
 async def index_message(m):
-    """Save message under its #code. Same file (unique id) is updated in place."""
+    """Save message under its #code. Same file (unique id) -> one item with many locations."""
     cap = m.caption or ""
     cm, mi = CODE_RE.search(cap), media_of(m)
     if not cm or not mi:
         return None
     code = cm.group(1).lower()
+    if code.startswith("__"):
+        return None
     fid, uid = mi
-    entry = {"u": uid, "f": fid, "c": m.chat.id, "m": m.id, "cap": cap}
+    loc = [m.chat.id, m.id]
     async with lock:
         items = await get_items(code)
-        for i, it in enumerate(items):
+        for it in items:
             if it["u"] == uid:
-                items[i] = entry
+                it["f"], it["cap"] = fid, cap
+                it["l"] = [x for x in it["l"] if x[0] != loc[0]] + [loc]
                 break
         else:
-            items.append(entry)
+            items.append({"u": uid, "f": fid, "cap": cap, "l": [loc]})
         await put_items(code, items)
     return code, len(items)
 
 
 async def send_item(c, chat_id, it):
-    try:  # 1) copy from DB channel  2) fallback: send by saved file_id
-        return await retry(c.copy_message, chat_id, it["c"], it["m"], protect_content=PROTECT)
-    except Exception:
-        return await retry(c.send_cached_media, chat_id, it["f"],
-                           caption=it["cap"], protect_content=PROTECT)
+    # 1) copy from any saved channel location  2) fallback: send by file_id (same bot only)
+    for chat, mid in it["l"]:
+        try:
+            return await retry(c.copy_message, chat_id, chat, mid, protect_content=PROTECT)
+        except Exception:
+            continue
+    return await retry(c.send_cached_media, chat_id, it["f"],
+                       caption=it["cap"], protect_content=PROTECT)
 
 
 async def joined(c, uid):
@@ -165,18 +173,27 @@ async def start(c, m):
 # ---------- admin side ----------
 @app.on_message(filters.private & media & is_admin)
 async def upload(c, m):
-    if not CODE_RE.search(m.caption or ""):
+    cm = CODE_RE.search(m.caption or "")
+    if not cm or cm.group(1).startswith("__"):
         return await m.reply("✏️ Caption mein #code likho, jaise #movie1", quote=True)
-    saved = await m.copy(DB_CHANNEL)
-    res = await index_message(saved)
+    res = None
+    for ch in CHANNELS:
+        try:
+            saved = await retry(m.copy, ch)
+            res = await index_message(saved) or res
+        except Exception as e:
+            logging.warning("copy to %s failed: %s", ch, e)
+            await m.reply(f"⚠️ Channel {ch} mein save nahi hua (bot admin hai?)", quote=True)
+    if not res:
+        return await m.reply("❌ Save failed.", quote=True)
     code, n = res
     await m.reply(f"✅ #{code} ({n} file{'s' if n > 1 else ''})\n🔗 {WORKER_URL}/{code}",
                   quote=True, disable_web_page_preview=True)
 
 
-@app.on_message(filters.chat(DB_CHANNEL) & media)
+@app.on_message(filters.chat(CHANNELS) & media)
 async def channel_post(c, m):
-    # files posted/forwarded straight into the DB channel with #code get indexed too
+    # files posted/forwarded straight into a DB/backup channel with #code get indexed too
     res = await index_message(m)
     if res:
         logging.info("indexed from channel: %s", res)
@@ -200,23 +217,34 @@ async def export_cmd(c, m):
 
 @app.on_message(filters.command("restore") & filters.private & is_admin)
 async def restore_cmd(c, m):
-    """After creating a new DB channel (set DB_CHANNEL env, redeploy): re-upload everything."""
+    """After changing DB_CHANNEL / BACKUP_CHANNEL env: fill every channel with all files."""
     status = await m.reply("♻️ Restoring…")
     ok = bad = 0
     async with lock:
         for code in await list_codes():
             items = await get_items(code)
             for it in items:
-                if it["c"] == DB_CHANNEL:
-                    continue
-                try:
-                    s = await retry(c.send_cached_media, DB_CHANNEL, it["f"], caption=it["cap"])
-                    it["c"], it["m"] = s.chat.id, s.id
+                for target in CHANNELS:
+                    if any(x[0] == target for x in it["l"]):
+                        continue
+                    new_msg = None
+                    for chat, mid in it["l"]:
+                        try:
+                            new_msg = await retry(c.copy_message, target, chat, mid)
+                            break
+                        except Exception:
+                            continue
+                    if not new_msg:
+                        try:
+                            new_msg = await retry(c.send_cached_media, target, it["f"], caption=it["cap"])
+                        except Exception as e:
+                            bad += 1
+                            logging.warning("restore failed %s: %s", code, e)
+                            continue
+                    it["l"].append([new_msg.chat.id, new_msg.id])
                     ok += 1
-                except Exception as e:
-                    bad += 1
-                    logging.warning("restore failed %s: %s", code, e)
-                await asyncio.sleep(1)
+                    await asyncio.sleep(1)
+                it["l"] = [x for x in it["l"] if x[0] in CHANNELS] or it["l"]
             await put_items(code, items)
     await status.edit(f"✅ Restored {ok}, failed {bad}")
 
@@ -230,6 +258,10 @@ async def main():
     runner = web.AppRunner(web_app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    try:
+        await api("POST", "put", params={"code": "__cfg_bot"}, data=app.me.username)
+    except Exception as e:
+        logging.error("could not save bot username to worker: %s", e)
     logging.info("Bot @%s running", app.me.username)
     await idle()
     await app.stop()
