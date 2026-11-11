@@ -14,10 +14,18 @@ Environment variables (see MIGRATION.md):
   API_SECRET    required   same value the bot uses (sent as the x-secret header)
   DATABASE_URL  required for --apply; optional for a dry run (enables the read-only comparison with PostgreSQL)
 
+COMPLETENESS. The Worker's GET /api/list is called exactly like bot.py calls it (no parameters) and is only known to
+return one JSON array of key names. Nothing in this repository shows a cursor, so none is invented. A single list call
+can therefore silently be cut off (Cloudflare KV lists at most 1000 keys per page). The script refuses to call a key list
+complete unless you confirm the total with --expect-keys N (the key count of the KV namespace, taken from the Cloudflare
+dashboard or API, NOT from this script). --apply without --expect-keys, a list whose size differs from N, or a list whose
+size is a multiple of 1000 without a matching N all stop the run before anything is written.
+
 Examples:
-  python migrate_kv_to_pg.py                      # dry run (default)
-  python migrate_kv_to_pg.py --apply              # real migration
-  python migrate_kv_to_pg.py --apply --update-existing
+  python migrate_kv_to_pg.py --expect-keys 1234                    # dry run (default)
+  python migrate_kv_to_pg.py --expect-keys 1234 --show-target      # also print the PostgreSQL hostname
+  python migrate_kv_to_pg.py --expect-keys 1234 --apply            # real migration
+  python migrate_kv_to_pg.py --expect-keys 1234 --apply --update-existing
 """
 import argparse
 import asyncio
@@ -40,7 +48,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 LOCK_ID = 727002            # advisory lock for this script (bot.py uses 727001 for schema creation)
 BATCH = 500                 # rows per INSERT/UPDATE statement
-LIST_LIMIT_WARN = 1000      # Cloudflare KV returns at most 1000 keys per list page
+LIST_PAGE_SIZE = 1000       # Cloudflare KV returns at most 1000 keys per list page
 INT32, INT64 = 2 ** 31 - 1, 2 ** 63 - 1
 
 log = logging.getLogger("kv-migrate")
@@ -90,19 +98,29 @@ def err_text(e):
 @dataclass(frozen=True)
 class Table:
     name: str
-    keys: tuple                  # ((column, pg type), ...) = primary key
+    keys: tuple                  # ((column, pg type), ...) = primary key (ON CONFLICT target)
     vals: tuple = ()             # ((column, pg type), ...)
-    has_updated_at: bool = False
+    ts_col: str = ""             # timestamptz column the INSERT leaves to its DEFAULT (and UPDATE sets, if updated_at)
+    numeric: tuple = ()          # ((column, precision, scale), ...) for NUMERIC(p,s) columns
+
+    @property
+    def has_updated_at(self):
+        return self.ts_col == "updated_at"
+
+    @property
+    def pk_columns(self):
+        return tuple(c for c, _ in self.keys)
 
 
-T_CODES = Table("codes", (("code", "text"),), (("items", "jsonb"),), True)
-T_DOCS = Table("kv_docs", (("key", "text"),), (("value", "jsonb"),), True)
+T_CODES = Table("codes", (("code", "text"),), (("items", "jsonb"),), "updated_at")
+T_DOCS = Table("kv_docs", (("key", "text"),), (("value", "jsonb"),), "updated_at")
 T_QUOTA = Table("daily_quota", (("day", "text"), ("uid", "bigint"), ("instance_id", "text")), (("used", "integer"),))
-T_PREM = Table("premium_users", (("uid", "bigint"),), (("per_day", "integer"), ("expires_at", "bigint")), True)
-T_DONE = Table("premium_done", (("order_id", "text"),))
+T_PREM = Table("premium_users", (("uid", "bigint"),), (("per_day", "integer"), ("expires_at", "bigint")), "updated_at")
+T_DONE = Table("premium_done", (("order_id", "text"),), (), "created_at")
 T_ORDERS = Table("orders", (("order_id", "text"),),
                  (("instance_id", "text"), ("uid", "bigint"), ("idx", "integer"),
-                  ("price", "numeric"), ("chat", "bigint"), ("mid", "bigint"), ("ts", "bigint")))
+                  ("price", "numeric"), ("chat", "bigint"), ("mid", "bigint"), ("ts", "bigint")),
+                 "", (("price", 10, 2),))
 TABLES = [T_CODES, T_DOCS, T_QUOTA, T_PREM, T_DONE, T_ORDERS]
 GROUPS = {"codes": [T_CODES], "docs": [T_DOCS], "quota": [T_QUOTA],
           "premium": [T_PREM, T_DONE], "orders": [T_ORDERS]}
@@ -570,28 +588,70 @@ def _columns(table):
     return list(table.keys) + list(table.vals)
 
 
+def schema_problems(tables, cols, pks):
+    """Compare the live schema with what the script will write. Pure function (unit-tested).
+    cols: {(table, column): row with data_type, numeric_precision, numeric_scale, is_nullable, column_default}
+    pks:  {table: {primary-key column names}}.  Returns a list of problem texts - empty means the schema fits."""
+    problems = []
+    for t in tables:
+        if not any(tn == t.name for tn, _ in cols):
+            problems.append(f"table '{t.name}' does not exist (run schema.sql first)")
+            continue
+        for col, ptype in _columns(t):                               # every column INSERT/UPDATE names
+            got = cols.get((t.name, col))
+            if got is None:
+                problems.append(f"{t.name}.{col} column is missing")
+            elif got["data_type"] != ptype:
+                problems.append(f"{t.name}.{col} is '{got['data_type']}', expected '{ptype}'")
+        for col, prec, scale in t.numeric:                           # NUMERIC(10,2): precision AND scale
+            got = cols.get((t.name, col))
+            if got is not None and got["data_type"] == "numeric" and \
+                    (got["numeric_precision"], got["numeric_scale"]) != (prec, scale):
+                have = ("numeric" if got["numeric_precision"] is None
+                        else f"numeric({got['numeric_precision']},{got['numeric_scale']})")
+                problems.append(f"{t.name}.{col} is {have}, expected numeric({prec},{scale})")
+        if t.ts_col:                                                 # timestamp the INSERT leaves to its DEFAULT
+            got = cols.get((t.name, t.ts_col))
+            if got is None:
+                problems.append(f"{t.name}.{t.ts_col} column is missing")
+            else:
+                if got["data_type"] != "timestamp with time zone":
+                    problems.append(f"{t.name}.{t.ts_col} is '{got['data_type']}', expected 'timestamp with time zone'")
+                if got["column_default"] is None and got["is_nullable"] != "YES":
+                    problems.append(f"{t.name}.{t.ts_col} is NOT NULL without a DEFAULT - the INSERT would fail")
+        have_pk = pks.get(t.name, set())                             # ON CONFLICT (...) needs exactly this key
+        if not have_pk:
+            problems.append(f"{t.name} has no PRIMARY KEY, expected ({', '.join(t.pk_columns)})")
+        elif have_pk != set(t.pk_columns):
+            problems.append(f"{t.name} PRIMARY KEY is ({', '.join(sorted(have_pk))}), "
+                            f"expected ({', '.join(t.pk_columns)})")
+    return problems
+
+
 class PostgresStore:
     def __init__(self, conn):
         self.conn = conn
 
     # -- schema check -------------------------------------------------
+    # Everything here is a SELECT on catalogs, so it also works in the READ ONLY dry-run transaction and for a
+    # SELECT-only role (pg_catalog is readable by everyone; information_schema.columns needs SELECT on the table).
+    COLUMNS_SQL = ("SELECT table_name, column_name, data_type, numeric_precision, numeric_scale, is_nullable, "
+                   "column_default FROM information_schema.columns "
+                   "WHERE table_schema = current_schema() AND table_name = ANY($1::text[])")
+    PK_SQL = ("SELECT c.relname AS table_name, a.attname AS column_name "
+              "FROM pg_catalog.pg_index i "
+              "JOIN pg_catalog.pg_class c ON c.oid = i.indrelid "
+              "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+              "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) "
+              "WHERE i.indisprimary AND n.nspname = current_schema() AND c.relname = ANY($1::text[])")
+
     async def check_schema(self, tables):
-        rows = await self.conn.fetch(
-            "SELECT table_name, column_name, data_type FROM information_schema.columns "
-            "WHERE table_schema = current_schema() AND table_name = ANY($1::text[])", [t.name for t in tables])
-        have = {(r["table_name"], r["column_name"]): r["data_type"] for r in rows}
-        problems = []
-        for t in tables:
-            if not any(tn == t.name for tn, _ in have):
-                problems.append(f"table '{t.name}' does not exist (run schema.sql first)")
-                continue
-            for col, ptype in _columns(t):
-                got = have.get((t.name, col))
-                if got is None:
-                    problems.append(f"{t.name}.{col} column is missing")
-                elif got != ptype:
-                    problems.append(f"{t.name}.{col} is '{got}', expected '{ptype}'")
-        return problems
+        names = [t.name for t in tables]
+        cols = {(r["table_name"], r["column_name"]): r for r in await self.conn.fetch(self.COLUMNS_SQL, names)}
+        pks = {}
+        for r in await self.conn.fetch(self.PK_SQL, names):
+            pks.setdefault(r["table_name"], set()).add(r["column_name"])
+        return schema_problems(tables, cols, pks)
 
     # -- reads --------------------------------------------------------
     async def fetch_existing(self, table, keys):
@@ -653,15 +713,16 @@ class PostgresStore:
 class MemoryStore:
     """Same contract as PostgresStore, kept in RAM (used by the self-tests; also handy for experiments)."""
 
-    def __init__(self, missing_tables=(), wrong_types=None):
+    def __init__(self, missing_tables=(), wrong_types=None, schema_problems=()):
         self.data = {t.name: {} for t in TABLES}
         self.missing_tables, self.wrong_types = set(missing_tables), wrong_types or {}
+        self.extra_problems = list(schema_problems)
         self.writes = 0
 
     async def check_schema(self, tables):
         problems = [f"table '{t.name}' does not exist (run schema.sql first)" for t in tables if t.name in self.missing_tables]
         problems += [f"{k} is wrong type" for k in self.wrong_types]
-        return problems
+        return problems + self.extra_problems
 
     async def fetch_existing(self, table, keys):
         d = self.data[table.name]
@@ -725,11 +786,13 @@ async def verify_table(store, table, desired, expect_equal_keys):
         raise VerifyError(f"{table.name}: {len(bad)} row(s) differ from the source after writing")
 
 
-async def run_tables(store, plan, tables, apply, update_existing):
+async def run_tables(store, plan, tables, apply, update_existing, before_write=None):
     results = {}
-    problems = await store.check_schema(tables)
+    problems = await store.check_schema(tables)                 # read-only; a mismatch ends the run here
     if problems:
         raise SchemaMismatch("; ".join(problems))
+    if before_write is not None:                                # e.g. the advisory lock - only after the schema fits
+        await before_write()
     for t in tables:
         res, new, same, differs = await sync_table(store, t, plan.rows[t.name], apply, update_existing)
         results[t.name] = res
@@ -748,14 +811,61 @@ async def run_postgres(dsn, plan, tables, apply, update_existing):
                                  statement_cache_size=0)      # required behind Neon's pgbouncer endpoint
     try:
         async with conn.transaction(readonly=not apply):    # dry run: PostgreSQL itself refuses any write
-            if apply:
-                await conn.execute(f"SELECT pg_advisory_xact_lock({LOCK_ID})")   # one migration at a time
-            return await run_tables(PostgresStore(conn), plan, tables, apply, update_existing)
+            async def lock():                                # one migration at a time (apply only)
+                await conn.execute(f"SELECT pg_advisory_xact_lock({LOCK_ID})")
+            return await run_tables(PostgresStore(conn), plan, tables, apply, update_existing,
+                                    before_write=lock if apply else None)
     finally:
         try:
             await asyncio.wait_for(conn.close(), timeout=10)
         except Exception:                                    # noqa: BLE001
             conn.terminate()
+
+
+# ======================================================================
+#  Key-list completeness and target confirmation
+# ======================================================================
+LIST_OK, LIST_UNVERIFIED, LIST_FAIL = "verified", "unverified", "fail"
+
+
+def assess_key_list(n, expect_keys):
+    """Can the key list the Worker returned be trusted to be complete? -> (LIST_OK | LIST_UNVERIFIED | LIST_FAIL, text).
+    n = number of distinct keys listed. expect_keys = the independently obtained total (--expect-keys) or None.
+    A bare JSON array carries no 'more keys follow' marker, so only an independent count can prove completeness."""
+    if expect_keys is not None:
+        if n == expect_keys:
+            return LIST_OK, f"key list complete: {n} keys listed = --expect-keys {expect_keys}"
+        word = "fewer" if n < expect_keys else "more"
+        return LIST_FAIL, (f"the Worker listed {n} keys but --expect-keys is {expect_keys} ({word} than expected). "
+                           f"The list is incomplete or the expected count is wrong - no migration can be trusted")
+    if n == 0:
+        return LIST_FAIL, "the Worker listed 0 keys (wrong WORKER_URL/API_SECRET, or an empty namespace?)"
+    if n % LIST_PAGE_SIZE == 0:
+        return LIST_FAIL, (f"the Worker listed exactly {n} keys, a multiple of Cloudflare's {LIST_PAGE_SIZE}-key page size: "
+                           f"the list is probably cut off at a page boundary. Pass --expect-keys N with the real total")
+    return LIST_UNVERIFIED, (f"{n} keys listed, but nothing proves the Worker returned all of them (its /api/list has no "
+                             f"cursor or completeness marker). Pass --expect-keys N with the real total to verify")
+
+
+_HOST_RE = re.compile(r"[a-z0-9._:\[\]-]{1,255}")
+
+
+def target_host(url):
+    """Hostname of a PostgreSQL URL - and nothing else - or None when it cannot be determined with certainty.
+    A URL whose password holds an unescaped / ? # or @ is parsed unreliably: the 'host' could then be a piece of the
+    credentials, so those cases print nothing rather than risk leaking them."""
+    try:
+        p = urlsplit(url)
+        host, user, pw, _ = p.hostname, p.username, p.password, p.port       # .port raises on a non-numeric port
+    except ValueError:
+        return None
+    if p.scheme not in ("postgres", "postgresql") or not host or not _HOST_RE.fullmatch(host):
+        return None
+    if "@" not in p.netloc and "@" in url[len(p.scheme) + 3:]:               # '@' after the netloc ended early
+        return None
+    if host in {(user or "").lower(), (pw or "").lower()}:
+        return None
+    return host
 
 
 # ======================================================================
@@ -787,11 +897,22 @@ def summarize_db(results, apply, update_existing):
                     "Add --update-existing to refresh them from KV.", diff_total)
 
 
-def migrate(reader, dsn, apply, update_existing, groups, concurrency, use_db=True, store_factory=None):
-    """Whole run. Returns an exit code: 0 ok, 1 fatal (nothing written), 2 finished but some records were skipped."""
+EXIT_OK, EXIT_FATAL, EXIT_SKIPPED, EXIT_UNVERIFIED = 0, 1, 2, 3
+
+
+def migrate(reader, dsn, apply, update_existing, groups, concurrency, use_db=True, store_factory=None,
+            expect_keys=None, show_target=False):
+    """Whole run. Returns an exit code: 0 ok, 1 fatal (nothing written), 2 finished but some records were skipped,
+    3 dry run finished but the completeness of the KV key list could not be verified (no --expect-keys)."""
     tables = [t for g in groups for t in GROUPS[g]]
     log.info("mode: %s%s | tables: %s", "APPLY (writes to PostgreSQL)" if apply else "DRY RUN (nothing is written)",
              " + update-existing" if update_existing else "", ", ".join(t.name for t in tables))
+    if show_target:                                          # hostname only - never user, password, port or database
+        if not (use_db and dsn):
+            log.info("target PostgreSQL host: none (no database is contacted)")
+        else:
+            host = target_host(dsn)
+            log.info("target PostgreSQL host: %s", host or "(could not be determined safely from DATABASE_URL)")
     t0 = time.time()
     try:
         log.info("reading key list from the Worker ...")
@@ -799,12 +920,20 @@ def migrate(reader, dsn, apply, update_existing, groups, concurrency, use_db=Tru
     except KVError as e:
         log.error("cannot list KV keys: %s", e)
         return 1
-    if len(keys) >= LIST_LIMIT_WARN and len(keys) % LIST_LIMIT_WARN == 0:
-        log.warning("the Worker returned exactly %d keys - Cloudflare lists max 1000 per page; if the Worker does not "
-                    "follow the cursor, some keys are missing. Compare with the number of codes in the bot's stats.", len(keys))
     if len(set(keys)) != len(keys):
         log.warning("the key list contains duplicates - they are read once")
         keys = list(dict.fromkeys(keys))
+    verdict, why = assess_key_list(len(keys), expect_keys)
+    if verdict == LIST_OK:
+        log.info(why)
+    elif verdict == LIST_FAIL:
+        log.error("%s. Aborting before reading values or touching PostgreSQL.", why)
+        return EXIT_FATAL
+    elif apply:
+        log.error("%s. --apply requires a verified key list - nothing was written.", why)
+        return EXIT_FATAL
+    else:
+        log.warning("COMPLETENESS NOT VERIFIED: %s", why)
 
     wanted = set(tables)
     want_kinds = {K_CODE: T_CODES, K_DOC: T_DOCS, K_QUOTA: T_QUOTA, K_PREM: T_PREM, K_ORDERS: T_ORDERS}
@@ -827,7 +956,7 @@ def migrate(reader, dsn, apply, update_existing, groups, concurrency, use_db=Tru
             log.error("DATABASE_URL is required for --apply")
             return 1
         log.info("no PostgreSQL comparison (DATABASE_URL not set or --no-db). Dry run finished.")
-        return 2 if plan.issues else 0
+        return _finish_code(plan, verdict)
     try:
         if store_factory:                                  # tests
             results = asyncio.run(_with_store(store_factory(), plan, tables, apply, update_existing))
@@ -848,8 +977,15 @@ def migrate(reader, dsn, apply, update_existing, groups, concurrency, use_db=Tru
     if plan.issues:
         log.warning("%d record(s) were skipped as invalid (see warnings above). They are still in KV untouched; "
                     "fix or review them before relying on PostgreSQL.", len(plan.issues))
-        return 2
-    return 0
+    return _finish_code(plan, verdict)
+
+
+def _finish_code(plan, verdict):
+    """Never a clean 0 unless the key list was verified complete; an unverified list outranks skipped records."""
+    if verdict != LIST_OK:
+        log.warning("exit code 3: the run is NOT a proof of completeness - re-run with --expect-keys N.")
+        return EXIT_UNVERIFIED
+    return EXIT_SKIPPED if plan.issues else EXIT_OK
 
 
 async def _with_store(store, plan, tables, apply, update_existing):
@@ -867,6 +1003,11 @@ def main(argv=None):
     ap.add_argument("--concurrency", type=int, default=8, help="parallel KV reads (1-32, default 8)")
     ap.add_argument("--timeout", type=int, default=20, help="seconds per Worker request (default 20)")
     ap.add_argument("--no-db", action="store_true", help="dry run only: skip the read-only PostgreSQL comparison")
+    ap.add_argument("--expect-keys", type=int, metavar="N", default=None,
+                    help="total number of keys in the KV namespace (from the Cloudflare dashboard/API). The run stops if "
+                         "the Worker lists a different number; REQUIRED for --apply, because /api/list cannot prove it is complete")
+    ap.add_argument("--show-target", action="store_true",
+                    help="print the PostgreSQL hostname from DATABASE_URL (hostname only - no user, password or database)")
     args = ap.parse_args(argv)
 
     handler = logging.StreamHandler(sys.stdout)
@@ -899,10 +1040,18 @@ def main(argv=None):
     if not groups or any(g not in GROUPS for g in groups):
         log.error("--only must be a comma list of: %s", ", ".join(GROUPS))
         return 1
+    if args.expect_keys is not None and args.expect_keys < 0:
+        log.error("--expect-keys must be 0 or more")
+        return 1
+    if args.apply and args.expect_keys is None:
+        log.error("--apply requires --expect-keys N (the real key count of the KV namespace): the Worker's key list "
+                  "cannot prove that it is complete. Nothing was written.")
+        return 1
     conc = min(max(args.concurrency, 1), 32)
     try:
         return migrate(KVReader(worker, secret, args.timeout), dsn, args.apply, args.update_existing,
-                       groups, conc, use_db=not args.no_db)
+                       groups, conc, use_db=not args.no_db, expect_keys=args.expect_keys,
+                       show_target=args.show_target)
     except KeyboardInterrupt:
         log.error("interrupted - nothing was committed")
         return 1
