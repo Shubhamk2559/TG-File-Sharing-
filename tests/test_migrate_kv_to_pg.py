@@ -30,6 +30,7 @@ SECRET = "worker-secret-XYZ-123"
 PASSWORD = "pw-s3cr3t-9876"
 DSN = f"postgresql://neondb_owner:{PASSWORD}@ep-test-pooler.example.neon.tech/neondb?sslmode=require&channel_binding=require"
 TODAY = "2026-11-11"
+BOT_SHA256 = "a0e839782208404b242dd412d658bfa6eb3174d31f908fc1e4c4e07d55739672"   # bot.py as delivered in Step 4.1; Step 4.2 must not change it
 
 ITEM = {"u": "uniq1", "f": "fileid1", "cap": "<b>Title</b> #abcd2345", "l": [[-1001234567890, 11], [-1009876543210, 12]]}
 
@@ -72,8 +73,9 @@ KV = {
 class MockWorker:
     """Local stand-in for the Cloudflare Worker: GET /api/list and /api/get only; records everything."""
 
-    def __init__(self, kv, fail_keys=()):
+    def __init__(self, kv, fail_keys=(), list_limit=None, list_body=None, list_extra=()):
         self.kv, self.fail_keys = kv, set(fail_keys)
+        self.list_limit, self.list_body, self.list_extra = list_limit, list_body, list(list_extra)
         self.requests = []          # (method, path)
         outer = self
 
@@ -96,7 +98,10 @@ class MockWorker:
                 if method != "GET":
                     return self._reply(405, "no")
                 if u.path == "/api/list":
-                    return self._reply(200, json.dumps(list(outer.kv)))
+                    if outer.list_body is not None:                        # e.g. an envelope with a cursor
+                        return self._reply(200, json.dumps(outer.list_body))
+                    names = list(outer.kv)[:outer.list_limit] + outer.list_extra   # list_limit = a Worker that cuts off
+                    return self._reply(200, json.dumps(names))
                 if u.path == "/api/get":
                     key = parse_qs(u.query)["code"][0]
                     if key in outer.fail_keys:
@@ -113,7 +118,7 @@ class MockWorker:
 
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        threading.Thread(target=self.srv.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()   # fast shutdown
 
     def close(self):
         self.srv.shutdown()
@@ -138,10 +143,17 @@ class LogCapture:
         return self.buf.getvalue()
 
 
-def run(worker, store, apply=False, update=False, groups=None, use_db=True, dsn=DSN):
+_AUTO = object()
+
+
+def run(worker, store, apply=False, update=False, groups=None, use_db=True, dsn=DSN, expect=_AUTO, show_target=False,
+        concurrency=4):
+    """expect: _AUTO = the operator supplies the real key count (len of the mock KV); None = no --expect-keys."""
     reader = m.KVReader(worker.url, SECRET, timeout=5, retries=2)
-    return m.migrate(reader, dsn, apply, update, groups or list(m.GROUPS), 4, use_db=use_db,
-                     store_factory=lambda: store)
+    if expect is _AUTO:
+        expect = len(worker.kv)
+    return m.migrate(reader, dsn, apply, update, groups or list(m.GROUPS), concurrency, use_db=use_db,
+                     store_factory=lambda: store, expect_keys=expect, show_target=show_target)
 
 
 class ClassifyTests(unittest.TestCase):
@@ -340,7 +352,7 @@ class MigrationFlowTests(unittest.TestCase):
     def test_dry_run_without_database(self):
         with LogCapture() as cap:
             rc = run(self.worker, m.MemoryStore(), apply=False, use_db=False)
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 2)                                    # verified list, but invalid records exist
         self.assertIn("no PostgreSQL comparison", cap.text)
 
 
@@ -362,7 +374,7 @@ class MainCliTests(unittest.TestCase):
         return rc, out.getvalue()
 
     def test_missing_env_names_only(self):
-        rc, out = self.run_main(["--apply"], {})
+        rc, out = self.run_main(["--apply", "--expect-keys", "5"], {})
         self.assertEqual(rc, 1)
         self.assertIn("WORKER_URL", out)
         self.assertIn("DATABASE_URL", out)
@@ -370,7 +382,8 @@ class MainCliTests(unittest.TestCase):
     def test_default_is_dry_run_and_never_prints_secrets(self):
         w = MockWorker(copy.deepcopy(KV))
         self.addCleanup(w.close)
-        rc, out = self.run_main(["--no-db"], {"WORKER_URL": w.url, "API_SECRET": SECRET, "DATABASE_URL": DSN})
+        rc, out = self.run_main(["--no-db", "--expect-keys", str(len(KV))],
+                                {"WORKER_URL": w.url, "API_SECRET": SECRET, "DATABASE_URL": DSN})
         self.assertEqual(rc, 2)
         self.assertIn("DRY RUN", out)
         for needle in (SECRET, PASSWORD, "abcd2345"):
@@ -381,11 +394,33 @@ class MainCliTests(unittest.TestCase):
             m.main(["--apply", "--dry-run"])
 
 
+def good_columns():
+    """What information_schema.columns returns for a database built from schema.sql."""
+    rows = []
+    for t in m.TABLES:
+        for c, ty in m._columns(t):
+            rows.append({"table_name": t.name, "column_name": c, "data_type": ty, "is_nullable": "NO",
+                         "column_default": None, "numeric_precision": None, "numeric_scale": None})
+        for c, prec, scale in t.numeric:
+            row = next(r for r in rows if r["table_name"] == t.name and r["column_name"] == c)
+            row.update(numeric_precision=prec, numeric_scale=scale)
+        if t.ts_col:
+            rows.append({"table_name": t.name, "column_name": t.ts_col, "data_type": "timestamp with time zone",
+                         "is_nullable": "NO", "column_default": "now()", "numeric_precision": None, "numeric_scale": None})
+    return rows
+
+
+def good_pks():
+    return [{"table_name": t.name, "column_name": c} for t in m.TABLES for c in t.pk_columns]
+
+
 class FakeConn:
     """Records the SQL PostgresStore sends. Answers the schema check; holds no data."""
 
-    def __init__(self, dsn, kw, log):
+    def __init__(self, dsn, kw, log, columns=None, pks=None):
         self.dsn, self.kw, self.log, self.closed = dsn, kw, log, False
+        self.columns = good_columns() if columns is None else columns
+        self.pks = good_pks() if pks is None else pks
         self.tx_readonly, self.tx_exc = None, None
 
     def transaction(self, readonly=False):
@@ -407,8 +442,9 @@ class FakeConn:
     async def fetch(self, sql, *args):
         self.log.append(("fetch", sql, args))
         if "information_schema.columns" in sql:
-            return [{"table_name": t.name, "column_name": c, "data_type": ty}
-                    for t in m.TABLES for c, ty in m._columns(t)]
+            return self.columns
+        if "pg_catalog.pg_index" in sql:
+            return self.pks
         if sql.startswith(("INSERT", "UPDATE")):
             return [{}] * len(args[0])
         return []
@@ -427,8 +463,10 @@ class PostgresStoreSqlShapeTests(unittest.TestCase):
         self.log, self.conns = [], []
         fake = types.ModuleType("asyncpg")
 
+        self.columns, self.pks = good_columns(), good_pks()          # tests may break these before running
+
         async def connect(dsn, **kw):
-            c = FakeConn(dsn, kw, self.log)
+            c = FakeConn(dsn, kw, self.log, self.columns, self.pks)
             self.conns.append(c)
             return c
         fake.connect = connect
@@ -461,7 +499,12 @@ class PostgresStoreSqlShapeTests(unittest.TestCase):
         c = self.conns[0]
         self.assertFalse(c.tx_readonly)
         self.assertIsInstance(c.tx_exc, m.VerifyError)              # leaving the transaction block with an error = ROLLBACK
-        self.assertIn(f"pg_advisory_xact_lock({m.LOCK_ID})", self.log[0][1])
+        lock_at = [i for i, e in enumerate(self.log) if e[0] == "execute"]
+        self.assertEqual(len(lock_at), 1)
+        self.assertIn(f"pg_advisory_xact_lock({m.LOCK_ID})", self.log[lock_at[0]][1])
+        self.assertTrue(all(e[0] == "fetch" for e in self.log[:lock_at[0]]))     # schema SELECTs came first
+        self.assertTrue(any("information_schema.columns" in e[1] for e in self.log[:lock_at[0]]))
+        self.assertTrue(any("pg_catalog.pg_index" in e[1] for e in self.log[:lock_at[0]]))
         # verification runs right after each table is written, so the fake aborts after the first table (codes);
         # the INSERT of every table is therefore checked directly below
         first = [sql for _, sql, _ in self.log if sql.startswith("INSERT")]
@@ -507,6 +550,430 @@ class PostgresStoreSqlShapeTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertNotIn(PASSWORD, cap.text)
         self.assertNotIn(DSN, cap.text)
+
+
+# ======================================================================
+#  Step 4.2 - key-list completeness
+# ======================================================================
+def make_kv(n):
+    return {f"c{i:05d}": json.dumps([ITEM]) for i in range(n)}
+
+
+SIZES = (999, 1000, 1500, 2000, 2500)
+
+
+class AssessKeyListTests(unittest.TestCase):
+    def test_expect_keys_decides(self):
+        for n in SIZES:
+            self.assertEqual(m.assess_key_list(n, n)[0], m.LIST_OK, n)
+            self.assertEqual(m.assess_key_list(n, n + 1)[0], m.LIST_FAIL, n)
+            self.assertEqual(m.assess_key_list(n, n - 1)[0], m.LIST_FAIL, n)
+
+    def test_without_expect_keys_nothing_is_ever_ok(self):
+        self.assertEqual({n: m.assess_key_list(n, None)[0] for n in SIZES},
+                         {999: m.LIST_UNVERIFIED, 1000: m.LIST_FAIL, 1500: m.LIST_UNVERIFIED,
+                          2000: m.LIST_FAIL, 2500: m.LIST_UNVERIFIED})
+        self.assertEqual(m.assess_key_list(0, None)[0], m.LIST_FAIL)
+        self.assertEqual(m.assess_key_list(0, 0)[0], m.LIST_OK)
+
+
+class KeyListCompletenessTests(unittest.TestCase):
+    """The Worker has no cursor in bot.py's contract, so only --expect-keys can prove completeness."""
+
+    def go(self, real, listed=None, expect=_AUTO, apply=False, groups=("docs",), **wkw):
+        kv = make_kv(real)
+        worker = MockWorker(kv, list_limit=listed, **wkw)
+        self.addCleanup(worker.close)
+        store = m.MemoryStore()
+        with LogCapture() as cap:
+            rc = run(worker, store, apply=apply, groups=list(groups), expect=real if expect is _AUTO else expect)
+        return rc, store, worker, cap.text
+
+    def gets(self, worker):
+        return [r for r in worker.requests if r[1] == "/api/get"]
+
+    def test_complete_list_confirmed_by_expect_keys_passes(self):
+        for n in SIZES:
+            rc, store, worker, text = self.go(n)
+            self.assertEqual(rc, 0, n)
+            self.assertIn(f"key list complete: {n} keys listed = --expect-keys {n}", text)
+            self.assertEqual(store.writes, 0)
+
+    def test_dry_run_without_expect_keys_is_never_a_clean_success(self):
+        for n in (999, 1500, 2500):                                  # not a page multiple: unverified
+            rc, _, _, text = self.go(n, expect=None)
+            self.assertEqual(rc, m.EXIT_UNVERIFIED, n)
+            self.assertIn("COMPLETENESS NOT VERIFIED", text)
+            self.assertIn("exit code 3", text)
+        for n in (1000, 2000):                                       # exact page multiple: probable truncation
+            rc, _, _, text = self.go(n, expect=None)
+            self.assertEqual(rc, 1, n)
+            self.assertIn("multiple of", text)
+
+    def test_apply_without_expect_keys_is_refused_before_reading_or_writing(self):
+        for n in SIZES:
+            rc, store, worker, text = self.go(n, expect=None, apply=True, groups=list(m.GROUPS))
+            self.assertEqual(rc, 1, n)
+            self.assertEqual(store.writes, 0)
+            self.assertEqual(self.gets(worker), [], "no value may be read once the list is untrustworthy")
+            self.assertNotIn("Migration committed", text)
+
+    def test_truncated_listing_is_a_hard_failure(self):
+        for real, listed in ((1000, 999), (1500, 1000), (2000, 1000), (2500, 2000), (2500, 1000), (1500, 999)):
+            for apply in (False, True):
+                rc, store, worker, text = self.go(real, listed=listed, apply=apply, groups=list(m.GROUPS))
+                self.assertEqual(rc, 1, (real, listed, apply))
+                self.assertEqual(store.writes, 0)
+                self.assertEqual(self.gets(worker), [])
+                self.assertIn(f"listed {listed} keys but --expect-keys is {real}", text)
+                self.assertNotIn("Migration committed", text)
+                self.assertNotIn("Dry run finished", text)
+
+    def test_wrong_expected_count_fails_both_ways(self):
+        for expect in (1499, 1501, 0):
+            rc, store, _, text = self.go(1500, expect=expect, apply=True)
+            self.assertEqual(rc, 1)
+            self.assertEqual(store.writes, 0)
+        self.assertIn("incomplete or the expected count is wrong", text)
+
+    def test_apply_with_confirmed_count_migrates_everything_and_is_idempotent(self):
+        kv = make_kv(1500)
+        worker = MockWorker(kv)
+        self.addCleanup(worker.close)
+        store = m.MemoryStore()
+        with LogCapture() as cap:
+            rc = run(worker, store, apply=True, groups=["codes"], expect=1500, concurrency=16)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(store.data["codes"]), 1500)
+        self.assertIn("Migration committed", cap.text)
+        before = store.writes
+        with LogCapture():
+            self.assertEqual(run(worker, store, apply=True, groups=["codes"], expect=1500, concurrency=16), 0)
+        self.assertEqual(store.writes, before)
+
+    def test_apply_at_a_page_boundary_needs_and_accepts_the_confirmed_count(self):
+        for n in (1000, 2000):
+            rc, store, _, _ = self.go(n, apply=True, groups=["docs"])
+            self.assertEqual(rc, 0, n)
+            rc, store, _, _ = self.go(n, expect=n + 1, apply=True, groups=["docs"])
+            self.assertEqual(rc, 1, n)
+
+    def test_empty_listing_is_fatal_unless_zero_is_expected(self):
+        self.assertEqual(self.go(0, expect=None)[0], 1)
+        self.assertEqual(self.go(0, expect=0)[0], 0)
+
+    def test_duplicates_in_the_list_count_once(self):
+        rc, _, _, text = self.go(5, list_extra=["c00001", "c00002"])      # 7 names, 5 distinct
+        self.assertEqual(rc, 0)
+        self.assertIn("duplicates", text)
+        self.assertIn("5 keys listed = --expect-keys 5", text)
+
+    def test_a_cursor_envelope_is_not_guessed_at(self):
+        body = {"keys": list(make_kv(1000)), "cursor": "abc", "list_complete": False}
+        rc, store, worker, text = self.go(1000, list_body=body, apply=True, groups=list(m.GROUPS))
+        self.assertEqual(rc, 1)
+        self.assertEqual(store.writes, 0)
+        self.assertIn("did not return a JSON array", text)
+        self.assertEqual({q for _, q in worker.requests}, {"/api/list"})  # no cursor parameter was ever sent
+
+    def test_list_is_requested_exactly_like_bot_py_does(self):
+        worker = MockWorker(make_kv(3))
+        self.addCleanup(worker.close)
+        m.KVReader(worker.url, SECRET).list_keys()
+        self.assertEqual(worker.requests, [("GET", "/api/list")])
+
+
+class CompletenessCliTests(MainCliTests):
+    def test_apply_without_expect_keys_exits_before_contacting_anything(self):
+        w = MockWorker(make_kv(3))
+        self.addCleanup(w.close)
+        rc, out = self.run_main(["--apply"], {"WORKER_URL": w.url, "API_SECRET": SECRET, "DATABASE_URL": DSN})
+        self.assertEqual(rc, 1)
+        self.assertIn("--expect-keys", out)
+        self.assertEqual(w.requests, [])
+        for needle in (SECRET, PASSWORD):
+            self.assertNotIn(needle, out)
+
+    def test_negative_or_non_numeric_expect_keys(self):
+        w = MockWorker(make_kv(3))
+        self.addCleanup(w.close)
+        rc, out = self.run_main(["--expect-keys", "-1", "--no-db"], {"WORKER_URL": w.url, "API_SECRET": SECRET})
+        self.assertEqual(rc, 1)
+        self.assertEqual(w.requests, [])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            m.main(["--expect-keys", "many"])
+
+    def test_dry_run_exit_codes(self):
+        w = MockWorker(make_kv(5))
+        self.addCleanup(w.close)
+        env = {"WORKER_URL": w.url, "API_SECRET": SECRET}
+        self.assertEqual(self.run_main(["--no-db"], env)[0], 3)                          # unverified
+        self.assertEqual(self.run_main(["--no-db", "--expect-keys", "5"], env)[0], 0)    # verified, clean
+        self.assertEqual(self.run_main(["--no-db", "--expect-keys", "6"], env)[0], 1)    # mismatch
+
+
+# ======================================================================
+#  Step 4.2 - schema validation
+# ======================================================================
+def read_text(*parts):
+    with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), *parts), encoding="utf-8") as f:
+        return f.read()
+
+
+def cols_dict(rows):
+    return {(r["table_name"], r["column_name"]): r for r in rows}
+
+
+def pks_dict(rows):
+    out = {}
+    for r in rows:
+        out.setdefault(r["table_name"], set()).add(r["column_name"])
+    return out
+
+
+class SchemaProblemsTests(unittest.TestCase):
+    def check(self, mutate_cols=None, mutate_pks=None):
+        cols, pks = good_columns(), good_pks()
+        if mutate_cols:
+            mutate_cols(cols)
+        if mutate_pks:
+            mutate_pks(pks)
+        return m.schema_problems(m.TABLES, cols_dict(cols), pks_dict(pks))
+
+    @staticmethod
+    def col(rows, table, name):
+        return next(r for r in rows if r["table_name"] == table and r["column_name"] == name)
+
+    def test_schema_sql_shape_passes(self):
+        self.assertEqual(self.check(), [])
+
+    def test_table_definitions_match_schema_sql_file(self):
+        """The Table constants against the real schema.sql text (primary keys, numeric(p,s), timestamptz columns)."""
+        import re
+        sql = read_text("schema.sql")
+        for t in m.TABLES:
+            body = re.search(rf"CREATE TABLE IF NOT EXISTS {t.name} \((.*?)\n\);", sql, re.S).group(1)
+            pk = re.findall(r"PRIMARY KEY \(([^)]*)\)", body)
+            inline = re.findall(r"^\s*(\w+)\s+\w+.*PRIMARY KEY", body, re.M)
+            have = tuple(c.strip() for c in pk[0].split(",")) if pk else tuple(inline)
+            self.assertEqual(have, t.pk_columns, t.name)
+            for c, p, sc in t.numeric:
+                self.assertIn(f"{c}", body)
+                self.assertRegex(body, rf"{c}\s+NUMERIC\({p},{sc}\)")
+            if t.ts_col:
+                self.assertRegex(body, rf"{t.ts_col}\s+TIMESTAMPTZ NOT NULL DEFAULT now\(\)")
+
+    def test_missing_primary_key(self):
+        for t in m.TABLES:
+            probs = self.check(mutate_pks=lambda pks, t=t: pks.__setitem__(slice(None), [r for r in pks if r["table_name"] != t.name]))
+            self.assertEqual(len(probs), 1, t.name)
+            self.assertIn(f"{t.name} has no PRIMARY KEY", probs[0])
+
+    def test_wrong_primary_key_columns(self):
+        probs = self.check(mutate_pks=lambda pks: pks.remove({"table_name": "daily_quota", "column_name": "instance_id"}))
+        self.assertEqual(probs, ["daily_quota PRIMARY KEY is (day, uid), expected (day, uid, instance_id)"])
+        probs = self.check(mutate_pks=lambda pks: pks.append({"table_name": "orders", "column_name": "uid"}))
+        self.assertEqual(len(probs), 1)
+        self.assertIn("orders PRIMARY KEY is (order_id, uid)", probs[0])
+
+    def test_numeric_precision_and_scale(self):
+        def prec(rows):
+            self.col(rows, "orders", "price")["numeric_precision"] = 12
+        def scale(rows):
+            self.col(rows, "orders", "price")["numeric_scale"] = 3
+        def free(rows):
+            r = self.col(rows, "orders", "price")
+            r["numeric_precision"] = r["numeric_scale"] = None
+        self.assertEqual(self.check(prec), ["orders.price is numeric(12,2), expected numeric(10,2)"])
+        self.assertEqual(self.check(scale), ["orders.price is numeric(10,3), expected numeric(10,2)"])
+        self.assertEqual(self.check(free), ["orders.price is numeric, expected numeric(10,2)"])
+
+    def test_numeric_column_with_wrong_base_type_reports_once(self):
+        probs = self.check(lambda rows: self.col(rows, "orders", "price").update(data_type="double precision"))
+        self.assertEqual(probs, ["orders.price is 'double precision', expected 'numeric'"])
+
+    def test_timestamp_columns_used_by_insert_and_update(self):
+        ts = {"codes": "updated_at", "kv_docs": "updated_at", "premium_users": "updated_at", "premium_done": "created_at"}
+        for table, c in ts.items():
+            wrong = self.check(lambda rows: self.col(rows, table, c).update(data_type="timestamp without time zone"))
+            self.assertEqual(wrong, [f"{table}.{c} is 'timestamp without time zone', expected 'timestamp with time zone'"])
+            gone = self.check(lambda rows: rows.remove(self.col(rows, table, c)))
+            self.assertEqual(gone, [f"{table}.{c} column is missing"])
+            nodef = self.check(lambda rows: self.col(rows, table, c).update(column_default=None))
+            self.assertEqual(nodef, [f"{table}.{c} is NOT NULL without a DEFAULT - the INSERT would fail"])
+            nullable = self.check(lambda rows: self.col(rows, table, c).update(column_default=None, is_nullable="YES"))
+            self.assertEqual(nullable, [])                                        # INSERT would store NULL, still works
+
+    def test_updated_at_flag_matches_the_update_statement(self):
+        self.assertEqual({t.name for t in m.TABLES if t.has_updated_at}, {"codes", "kv_docs", "premium_users"})
+        self.assertEqual(m.T_DONE.ts_col, "created_at")
+
+    def test_missing_table_and_missing_or_wrong_columns_still_reported(self):
+        probs = self.check(lambda rows: rows.__setitem__(slice(None), [r for r in rows if r["table_name"] != "orders"]))
+        self.assertIn("table 'orders' does not exist (run schema.sql first)", probs)
+        self.assertEqual([p for p in probs if "orders" in p], ["table 'orders' does not exist (run schema.sql first)"])
+        probs = self.check(lambda rows: rows.remove(self.col(rows, "orders", "uid")))
+        self.assertEqual(probs, ["orders.uid column is missing"])
+        probs = self.check(lambda rows: self.col(rows, "orders", "uid").update(data_type="integer"))
+        self.assertEqual(probs, ["orders.uid is 'integer', expected 'bigint'"])
+
+
+class SchemaAbortsBeforeWriteTests(PostgresStoreSqlShapeTests):
+    """Through run_postgres with the recorded-SQL fake: a mismatch must stop the run before the lock and any write."""
+
+    def break_and_run(self, apply):
+        with self.assertRaises(m.SchemaMismatch) as cm:
+            asyncio.run(m.run_postgres(DSN, self.plan, m.TABLES, apply=apply, update_existing=True))
+        return str(cm.exception)
+
+    def assert_nothing_written(self):
+        self.assertTrue(all(kind == "fetch" for kind, _, _ in self.log), "only SELECTs may have run")
+        self.assertTrue(all(sql.startswith("SELECT") for _, sql, _ in self.log))
+        self.assertFalse([1 for _, sql, _ in self.log if "advisory" in sql or sql.startswith(("INSERT", "UPDATE"))])
+        self.assertTrue(self.conns[0].closed)
+        self.assertIsInstance(self.conns[0].tx_exc, m.SchemaMismatch)           # transaction block left with an error
+
+    def test_every_kind_of_mismatch_aborts_apply_before_lock_and_writes(self):
+        breakers = {
+            "pk": lambda: self.pks.remove({"table_name": "codes", "column_name": "code"}),
+            "numeric": lambda: next(r for r in self.columns if r["column_name"] == "price").update(numeric_scale=0),
+            "timestamp": lambda: next(r for r in self.columns
+                                      if (r["table_name"], r["column_name"]) == ("premium_done", "created_at")
+                                      ).update(data_type="date"),
+            "type": lambda: next(r for r in self.columns if r["column_name"] == "uid").update(data_type="text"),
+        }
+        for name, brk in breakers.items():
+            self.setUp()
+            brk()
+            msg = self.break_and_run(apply=True)
+            self.assertTrue(msg, name)
+            self.assert_nothing_written()
+
+    def test_dry_run_reports_the_same_mismatches(self):
+        self.pks.clear()
+        msg = self.break_and_run(apply=False)
+        self.assertIn("has no PRIMARY KEY", msg)
+        self.assertTrue(self.conns[0].tx_readonly)
+        self.assert_nothing_written()
+
+    def test_migrate_maps_schema_mismatch_to_exit_1_without_writes(self):
+        store = m.MemoryStore(schema_problems=["orders PRIMARY KEY is (uid), expected (order_id)"])
+        worker = MockWorker(copy.deepcopy(KV))
+        self.addCleanup(worker.close)
+        with LogCapture() as cap:
+            rc = run(worker, store, apply=True)
+        self.assertEqual(rc, 1)
+        self.assertEqual(store.writes, 0)
+        self.assertIn("schema does not match", cap.text)
+        self.assertNotIn("Migration committed", cap.text)
+
+    def test_check_schema_sql_is_select_only_and_uses_catalogs_a_select_only_role_can_read(self):
+        for sql in (m.PostgresStore.COLUMNS_SQL, m.PostgresStore.PK_SQL):
+            self.assertTrue(sql.startswith("SELECT"))
+            self.assertNotIn("table_constraints", sql)             # that view hides tables from a SELECT-only role
+
+
+# ======================================================================
+#  Step 4.2 - --show-target
+# ======================================================================
+class TargetHostTests(unittest.TestCase):
+    def test_hostname_only(self):
+        self.assertEqual(m.target_host(DSN), "ep-test-pooler.example.neon.tech")
+        self.assertEqual(m.target_host("postgres://u:p@Host.EXAMPLE.com:6543/db"), "host.example.com")
+        self.assertEqual(m.target_host("postgresql://localhost/db"), "localhost")
+        self.assertEqual(m.target_host("postgresql://u:p%40ss%2Fword@h.example.com/db"), "h.example.com")
+
+    def test_unparseable_or_risky_urls_print_nothing(self):
+        for bad in ("", "not a url", "mysql://u:p@h.example.com/db", "postgresql://u:p@/db",
+                    "postgresql://user:pa/ss@h.example.com/db",           # unescaped '/' in the password
+                    "postgresql://user:pa?ss@h.example.com/db",
+                    "postgresql://user:pa#ss@h.example.com/db",
+                    "postgresql://user:12/ss@h.example.com/db",          # looks like host 'user' port 12
+                    "postgresql://user:x@[::1/db"):
+            self.assertIsNone(m.target_host(bad), bad)
+
+    def run_with(self, dsn, **kw):
+        worker = MockWorker(make_kv(3))
+        self.addCleanup(worker.close)
+        with LogCapture() as cap:
+            rc = run(worker, m.MemoryStore(), dsn=dsn, **kw)
+        return rc, cap.text
+
+    def test_show_target_prints_host_and_no_credentials(self):
+        rc, text = self.run_with(DSN, show_target=True)
+        self.assertIn("target PostgreSQL host: ep-test-pooler.example.neon.tech", text)
+        for needle in (PASSWORD, DSN, "neondb_owner", "channel_binding", "sslmode", "postgresql://", "/neondb"):
+            self.assertNotIn(needle, text, needle)
+
+    def test_not_printed_unless_asked(self):
+        _, text = self.run_with(DSN)
+        self.assertNotIn("target PostgreSQL host", text)
+        self.assertNotIn("ep-test-pooler", text)
+
+    def test_risky_url_never_leaks_credentials(self):
+        dsn = "postgresql://neondb_owner:pa/ss-w0rd-77@ep-x.example.neon.tech/neondb"
+        REDACTOR_SAVE = list(m.REDACTOR.secrets)
+        self.addCleanup(lambda: setattr(m.REDACTOR, "secrets", REDACTOR_SAVE))
+        _, text = self.run_with(dsn, show_target=True)
+        self.assertIn("could not be determined safely", text)
+        for needle in ("neondb_owner", "pa/ss", "w0rd", "ep-x.example"):
+            self.assertNotIn(needle, text, needle)
+
+    def test_no_database_means_no_host(self):
+        _, text = self.run_with("", show_target=True)
+        self.assertIn("target PostgreSQL host: none", text)
+        _, text = self.run_with(DSN, show_target=True, use_db=False)
+        self.assertIn("target PostgreSQL host: none", text)
+        self.assertNotIn("ep-test-pooler", text)
+
+    def test_target_shown_before_anything_is_read_or_written(self):
+        worker = MockWorker(make_kv(3), list_limit=1)               # fatal later: --expect-keys mismatch
+        self.addCleanup(worker.close)
+        with LogCapture() as cap:
+            rc = run(worker, m.MemoryStore(), show_target=True, expect=3)
+        self.assertEqual(rc, 1)
+        self.assertLess(cap.text.index("target PostgreSQL host"), cap.text.index("--expect-keys is 3"))
+
+    def test_cli_flag(self):
+        w = MockWorker(make_kv(3))
+        self.addCleanup(w.close)
+        cli = MainCliTests()
+        rc, out = cli.run_main(["--show-target", "--expect-keys", "3", "--no-db"],
+                               {"WORKER_URL": w.url, "API_SECRET": SECRET, "DATABASE_URL": DSN})
+        self.assertEqual(rc, 0)
+        self.assertIn("target PostgreSQL host: none", out)
+        rc, out = cli.run_main(["--show-target", "--expect-keys", "3"],
+                               {"WORKER_URL": w.url, "API_SECRET": SECRET, "DATABASE_URL": DSN + "&application_name=x"})
+        self.assertIn("target PostgreSQL host: ep-test-pooler.example.neon.tech", out)
+        for needle in (PASSWORD, SECRET, "neondb_owner"):
+            self.assertNotIn(needle, out)
+
+
+# ======================================================================
+#  Step 4.2 - docs and the read-only guarantee
+# ======================================================================
+class DocsAndGuaranteeTests(unittest.TestCase):
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def test_migration_md_no_longer_claims_new_equals_zero_on_a_fresh_branch(self):
+        doc = read_text("MIGRATION.md")
+        self.assertNotIn("# 3. Run the dry run again: every table should show new = 0 and differs = 0", doc)
+        self.assertIn("--expect-keys", doc)
+        self.assertIn("--show-target", doc)
+        self.assertNotIn("the script warns when it receives exactly 1000", doc)
+
+    def test_key_counts_reconcile_on_the_fixture(self):
+        plan = m.build_plan(dict(KV), set(m.TABLES), now=1_762_800_000)
+        mapped = sum(v for k, v in plan.stats.items() if k.startswith("keys:"))
+        self.assertEqual(mapped + sum(plan.unmapped.values()), len(KV))              # "keys listed" = sum of patterns + NOT MIGRATED
+
+    def test_dry_run_still_read_only_and_bot_py_untouched(self):
+        import hashlib
+        with open(os.path.join(self.ROOT, "bot.py"), "rb") as f:
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), BOT_SHA256)
+        src = read_text("migrate_kv_to_pg.py")
+        self.assertIn("conn.transaction(readonly=not apply)", src)
+        self.assertNotIn("/api/put", src.replace("/api/put or /api/delete", ""))
 
 
 if __name__ == "__main__":
