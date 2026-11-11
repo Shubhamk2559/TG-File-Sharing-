@@ -1,0 +1,6 @@
+pyrofork
+tgcrypto
+aiohttp
+uvloop
+tzdata
+asyncpg
